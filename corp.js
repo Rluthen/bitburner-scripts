@@ -3,7 +3,7 @@
  * Watches the corporation once per corp cycle (10 s, 1 s with bonus time), reads game state through
  * Corp/corp-snapshot.js + ns.read, asks the PURE rule module (Corp/corp-rules.js) what is due, starts
  * the missing services + at most ONE spending job, and prints the whole lifecycle into this tail
- * window (workers report over log port CORP_LOG_PORT, drained by pump() below).
+ * window (workers report over log port CORP_LOG_PORT, drained by drainLog() below between awaits).
  *
  * Statically-referenced corporation APIs (docs figure, NOT measured - both are 0 GB, so the daemon
  * stays small on any home): nextUpdate, hasCorporation. Every other value arrives via the snapshot.
@@ -41,6 +41,24 @@ export function autocomplete(data, _) {
 
 /** Entry point. @param {NS} ns **/
 export async function main(ns) {
+    try {
+        await runDaemon(ns);
+    } catch (err) {
+        // The game prints an uncaught throw in the TERMINAL; the tail window (what the player watches) must
+        // say why the daemon stopped too, or a death looks like the script silently doing nothing.
+        const line = `corp.js stopped: ${err?.message ?? err}`;
+        try {
+            ns.print(line);
+            ns.tprint(line);
+            ns.write(LIFECYCLE_LOG, line + "\n", "a");
+        } catch {
+            // nothing we can do while dying
+        }
+        throw err;
+    }
+}
+
+async function runDaemon(ns) {
     const opts = getConfiguration(ns, argsSchema);
     if (!opts) return; // --help or a bad argument (getConfiguration already logged why)
     if ((await instanceCount(ns)) > 1) return; // never two daemons at once
@@ -83,10 +101,12 @@ export async function main(ns) {
     };
     banner(ns, ctx);
 
-    pump(ns, ctx); // started WITHOUT await: drains the workers' log port alongside the main loop
+    // No floating log-pump loop: Bitburner kills a script that calls any ns function while an ns.sleep()
+    // is pending, so the daemon keeps ONE ns-calling context and drains the port between awaits.
     await startup(ns, ctx); // corp-bn.js once, before the main loop
 
     for (;;) {
+        drainLog(ns, ctx); // everything the workers wrote while we were parked / working
         if (!ns.corporation.hasCorporation()) {
             await tickNoCorp(ns, ctx); // nextUpdate() throws without a corporation - sleep instead
             continue;
@@ -119,6 +139,7 @@ async function runCycle(ns, ctx, state) {
 /** No corporation yet: the round-1 job is what CREATES it, so keep ticking until it does. **/
 async function tickNoCorp(ns, ctx) {
     await ns.sleep(2000);
+    drainLog(ns, ctx); // a pending ns.sleep() blocks every other ns call, so print only after it resolves
     ctx.cycle++;
     ctx.installed = new Set(ns.ls("home", "Corp/"));
     ctx.runningJob = trackJob(ns, ctx);
@@ -280,6 +301,7 @@ function reportNotes(ns, ctx, notes) {
 /** One-shot startup: make sure /Temp/corp-bn.txt exists (T08) so the phase jobs and the offers
  * service can read the BitNode profile. A non-viable BitNode puts the daemon in observe-only mode. **/
 async function startup(ns, ctx) {
+    logLine(ns, ctx, "INFO", "reading the BitNode profile (Corp/corp-bn.js) ...");
     const res = await launch(ns, ctx, "Corp/corp-bn.js", [], true);
     if (!res.ok) return; // missing / no RAM - launch warned once; the daemon keeps going
     let bn;
@@ -296,26 +318,28 @@ async function startup(ns, ctx) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Log pump (workers -> this tail window)
+// Log drain (workers -> this tail window)
 
-/** Drain the worker log port into this tail window, forever (started without await).
- * A pending port nextWrite() and a pending nextUpdate() coexist: the game keeps a separate
- * promise/resolver per port (NetscriptPort.nextWrite, dev branch), independent of the corporation
- * promise, so both may be awaited at once. **/
-async function pump(ns, ctx) {
+/** Drain the worker log port into this tail window. Called BETWEEN awaits from the main loop only.
+ *
+ * Bitburner permits exactly ONE pending ns call per script: `netscriptDelay` (ns.sleep) sets the
+ * worker's `runningFn`, and any other ns call made while it is set trips the game's concurrency check,
+ * which KILLS the script (NetscriptHelpers.tsx checkEnvFlags). So the old floating pump loop - parked on
+ * port.nextWrite(), printing the moment a worker logged - got the daemon killed the first time the main
+ * chain was sleeping (e.g. while waiting for corp-bn.js). One context, drain on wake.
+ *
+ * ponytail: the port holds 50 lines (game default) and drops the oldest; a worker burst that outruns a
+ * single parked nextUpdate() can lose lines. Drain more often (smaller sleeps) if that ever shows up. **/
+function drainLog(ns, ctx) {
     const handle = ns.getPortHandle(CORP_LOG_PORT);
-    for (;;) {
-        let line;
-        while ((line = handle.read()) !== "NULL PORT DATA") {
-            if (typeof line !== "string") continue;
-            const { worker, level, message } = parseLogLine(line);
-            const text = `${stamp()} c${ctx.cycle} [${ctx.phase}] ${worker} ${level}: ${message}`;
-            ns.print(text);
-            append(ns, text);
-            if (level === "ERROR") ns.tprint(text);
-            if (level === "MILESTONE") ns.toast(message, "success");
-        }
-        await handle.nextWrite(); // 0 GB
+    for (let line; (line = handle.read()) !== "NULL PORT DATA"; ) {
+        if (typeof line !== "string") continue;
+        const { worker, level, message } = parseLogLine(line);
+        const text = `${stamp()} c${ctx.cycle} [${ctx.phase}] ${worker} ${level}: ${message}`;
+        ns.print(text);
+        append(ns, text);
+        if (level === "ERROR") ns.tprint(text);
+        if (level === "MILESTONE") ns.toast(message, "success");
     }
 }
 
@@ -340,7 +364,16 @@ async function launch(ns, ctx, script, args, wait) {
         return { ok: false, pid: 0, reason: "ram" };
     }
     ctx.warned.delete(`ram:${script}`); // a shortage that has cleared should warn again if it returns
-    return runWorker(ns, script, args, { wait });
+    const res = await runWorker(ns, script, args, { wait: false });
+    // Wait here rather than inside runWorker so the log port keeps being drained while a long job runs
+    // (draining is only legal between awaits - see the note in main()).
+    if (res.ok && wait) {
+        while (ns.isRunning(res.pid)) {
+            await ns.sleep(200);
+            drainLog(ns, ctx);
+        }
+    }
+    return res;
 }
 
 /** Append a line to the lifecycle log (0 GB): full history after the tail scrolls. **/

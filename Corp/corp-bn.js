@@ -3,6 +3,7 @@
  *
  * NS functions used directly, with the RAM line from the official docs (dev branch):
  *   ns.getResetInfo()                             1 GB  -> { currentNode, ownedSF }
+ *   ns.getBitNodeMultipliers()                    4 GB  (throws unless BN5 or SF5 - handled, see main)
  *   ns.corporation.canCreateCorporation(selfFund) 0 GB  (works without corporation API access)
  *   ns.corporation.hasCorporation()               0 GB
  *   ns.write(file, data, "w")                     0 GB
@@ -15,12 +16,18 @@
  *                  ns.getServer 2, ns.stock.getSymbols 2, ns.exec 1.3, ns.getResetInfo 1, ns.run 1, ...)
  *   => docs sum ~18 GB. Measure in-game with `mem Corp/corp-bn.js` — this is a docs figure, not a measurement.
  *
+ * Deliberately NOT using helpers' `tryGetBitNodeMultipliers`: it fetches multipliers through
+ * getNsDataThroughFile, i.e. a generated temp script run with ns.run and waited on in
+ * waitForProcessToComplete (up to 1000 retries, ~3 minutes) whenever that temp script cannot run. The
+ * daemon WAITS for this script during startup, so a slow fetch here looks like a dead daemon. The direct
+ * call below costs 4 GB and returns instantly; the fallback is the same hard-coded table helpers uses.
+ *
  * Sources: official `dev` docs; game source `dev/src/Corporation/helpers.ts` (canCreateCorporation) and
  * `dev/src/NetscriptFunctions/Corporation.ts` (the wrapper passes restart=false and logs when the check fails).
  * Guide refs: §2 FAQ p10 (seed money only in BN3, max 20 divisions), §4 p19, §17.2/§17.3/§17.4 p63-64. */
 
 import { BN_FILE, corpLog } from "./corp-lib.js";
-import { tryGetBitNodeMultipliers } from "../helpers.js";
+import { getNsDataThroughFile, getHardCodedBitNodeMultipliers } from "../helpers.js";
 
 const MAX_DIVISIONS_BN3 = 20; // guide §2 FAQ p10: "in BN3 it's 20"
 
@@ -63,8 +70,15 @@ export async function main(ns) {
     const canCreateSelf = ns.corporation.canCreateCorporation(true) === "Success"; // 0 GB
     const hasCorp = ns.corporation.hasCorporation(); // 0 GB
 
-    // Uses ns.getBitNodeMultipliers (needs BN5 or SF5) and falls back to helpers.js' hard-coded table.
-    const mults = await tryGetBitNodeMultipliers(ns);
+    // Multipliers WITHOUT helpers' spawn-a-temp-script machinery (see the header): the direct call returns
+    // instantly; getBitNodeMultipliers needs BN5 or SF5 and throws (one red Terminal line, caught here)
+    // otherwise, in which case helpers' hard-coded table gives the same numbers with no ns call at all.
+    let mults;
+    try {
+        mults = ns.getBitNodeMultipliers(); // 4 GB
+    } catch {
+        mults = await getHardCodedBitNodeMultipliers(ns, getNsDataThroughFile, bn); // pure when bnOverride is given
+    }
     const profile = { ...profileFromMultipliers(bn, mults, sf3), canCreateSeed: canCreateSeed, canCreateSelf: canCreateSelf };
 
     // canCreateCorporation reports "CorporationExists" once a corporation exists, which would wrongly mark a

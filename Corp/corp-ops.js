@@ -190,14 +190,17 @@ function setJob(ns, division, city, job, count) {
 }
 
 /** Put an office's employees into exactly the given jobs. setJobAssignment takes an absolute count per job and
- * throws when there are not enough Unassigned employees, so every job not listed is zeroed first.
+ * throws when there are not enough Unassigned employees, so every job not listed is zeroed first, and the
+ * listed ones are then applied in ASCENDING target count: only REDUCING a job hands its employees back to
+ * Unassigned, so a job that shrinks (e.g. "Research & Development": 0) must run before a job that grows off it
+ * (phase-round2 step 7: an office with everybody on R&D has Unassigned 0, and {Operations:3,...} throws first).
  * @param {Record<string, number>} jobs e.g. {"Operations": 2, "Engineer": 9}
  * @returns {boolean} false when any assignment failed **/
 export function assignJobs(ns, division, city, jobs) {
     const office = ns.corporation.getOffice(division, city);
     let ok = true;
     for (const job of SETTABLE_JOBS) if (!(job in jobs) && !setJob(ns, division, city, job, 0)) ok = false;
-    for (const [job, count] of Object.entries(jobs)) if (!setJob(ns, division, city, job, count)) ok = false;
+    for (const [job, count] of Object.entries(jobs).sort((a, b) => a[1] - b[1])) if (!setJob(ns, division, city, job, count)) ok = false;
     const changed = ok && Object.entries(jobs).some(([job, count]) => office.employeeJobs[job] !== count);
     if (!ok) corpLog(ns, `${division}/${city}: some job assignments failed`, "WARN");
     else if (changed) corpLog(ns, `${division}/${city}: jobs ${JSON.stringify(jobs)}`);
@@ -483,6 +486,15 @@ export async function selfCheck() {
         `assignJobs ${JSON.stringify(s.office.nextJobs)}`,
     );
     must(assignJobs(ns, "Dark Soil", "Sector-12", { Operations: 99 }) === false, "assignJobs reports the game's throw");
+    // The order trap: a listed job that SHRINKS must be applied before one that GROWS off it. An office with
+    // everybody on R&D has Unassigned 0, so "in the order listed" threw on Operations and left R&D at 5.
+    must(assignJobs(ns, "Dark Soil", "Sector-12", {}), "assignJobs clears every job");
+    must(assignJobs(ns, "Dark Soil", "Sector-12", { "Research & Development": 5 }), "assignJobs puts everybody on R&D");
+    must(assignJobs(ns, "Dark Soil", "Sector-12", { Operations: 3, "Research & Development": 0 }), "assignJobs empties R&D before growing Operations");
+    must(
+        s.office.nextJobs.Operations === 3 && s.office.nextJobs["Research & Development"] === 0 && s.office.nextJobs.Unassigned === 2,
+        `assignJobs release order ${JSON.stringify(s.office.nextJobs)}`,
+    );
 
     // Warehouse: bought when missing (5b), leveled, idempotent.
     const wh1 = ensureWarehouse(ns, "Dark Soil", "Aevum", 3, 100e9);

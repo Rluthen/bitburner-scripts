@@ -36,7 +36,7 @@ const R_R2 = "Corp/phase-round2.js";
 const R_R3 = "Corp/phase-round3.js";
 
 const MAX_DIVISIONS = 20; // BN3 max (§2 FAQ p10); other BNs use T08's maxDivisions
-const DUMMY_DIVISION_COST = 60e9; // 10e9 (Restaurant) + 5*4e9 offices + 6*5e9 warehouses (T20)
+const DUMMY_DIVISION_COST = 55e9; // 10e9 (Restaurant) + 5*4e9 offices + 5*5e9 warehouses (T20; Sector-12's office AND warehouse are created free with the division)
 const PHASE_RELAUNCH = 5; // don't hammer a phase job that just exited (job rule 1)
 const SUPPORT_CADENCE = { [AGRI_NAME]: 10, [CHEM_NAME]: 15 }; // §19.4.2 p77 / reference corporation.ts 923-944
 
