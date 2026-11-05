@@ -329,15 +329,17 @@ const basename = (script) => script.split("/").pop().replace(/\.js$/, "");
  * every call, which a per-cycle launcher would turn into a toast every 10 s on a small home. **/
 async function launch(ns, ctx, script, args, wait) {
     if (!ns.fileExists(script)) {
-        warnOnce(ns, ctx, `worker ${script} not installed yet - skipping`);
+        warnOnce(ns, ctx, `worker ${script} not installed yet - skipping`, `missing:${script}`);
         return { ok: false, pid: 0, reason: "missing" };
     }
     const needed = ns.getScriptRam(script, "home");
     const free = ns.getServerMaxRam("home") - ns.getServerUsedRam("home");
     if (needed > free) {
-        warnOnce(ns, ctx, `not enough home RAM for ${script}: needs ${needed.toFixed(2)} GB, free ${free.toFixed(2)} GB`);
+        // Key on the script, not the message: `free` changes every cycle and would defeat the dedupe.
+        warnOnce(ns, ctx, `not enough home RAM for ${script}: needs ${needed.toFixed(2)} GB, free ${free.toFixed(2)} GB`, `ram:${script}`);
         return { ok: false, pid: 0, reason: "ram" };
     }
+    ctx.warned.delete(`ram:${script}`); // a shortage that has cleared should warn again if it returns
     return runWorker(ns, script, args, { wait });
 }
 
@@ -366,9 +368,11 @@ function logLine(ns, ctx, level, message) {
 
 const mile = (ns, ctx, message) => logLine(ns, ctx, "MILESTONE", message);
 
-function warnOnce(ns, ctx, message) {
-    if (ctx.warned.has(message)) return;
-    ctx.warned.add(message);
+/** Log a WARN once. `key` (defaults to the message) must be stable: a message that embeds a changing
+ * value (free RAM) would otherwise re-warn every cycle. **/
+function warnOnce(ns, ctx, message, key = message) {
+    if (ctx.warned.has(key)) return;
+    ctx.warned.add(key);
     logLine(ns, ctx, "WARN", message);
 }
 
@@ -387,4 +391,24 @@ function banner(ns, ctx) {
         `${stamp()} corp.js daemon started [${mode}] - city ${ctx.options.productCity}, mat-ratio ${ctx.options.matRatio}, ` +
             `improve-every ${ctx.options.improveEvery}, custom-supply ${ctx.options.customSupply}`,
     );
+}
+
+/** Offline check of the warn-once / announce dedupe (no game - corp.js has no top-level ns use):
+ *   node --input-type=module -e "import('./corp.js').then(m=>m.selfCheck()).then(()=>console.log('corp.js selfCheck ok'))"
+ * Proves repeated warnings collapse to one line - NOT in-game correctness. **/
+export function selfCheck() {
+    const lines = [];
+    const ns = { print: (t) => lines.push(String(t)), write: () => {}, tprint: () => {}, toast: () => {} };
+    const ctx = { cycle: 1, phase: "R1", warned: new Set(), announced: new Set() };
+    // A message that embeds a changing value (free RAM) must still warn only once per key.
+    warnOnce(ns, ctx, "not enough home RAM for X: needs 1 GB, free 1 GB", "ram:X");
+    warnOnce(ns, ctx, "not enough home RAM for X: needs 1 GB, free 2 GB", "ram:X");
+    if (lines.length !== 1) throw new Error(`warnOnce dedupe: logged ${lines.length}, want 1`);
+    ctx.warned.delete("ram:X"); // a cleared shortage may warn again
+    warnOnce(ns, ctx, "not enough home RAM for X: needs 1 GB, free 3 GB", "ram:X");
+    if (lines.length !== 2) throw new Error(`warnOnce re-warn after clear: logged ${lines.length}, want 2`);
+    announce(ns, ctx, "DRYRUN would start", "Corp/corp-advert.js", []); // dedupes per (tag, script)
+    announce(ns, ctx, "DRYRUN would start", "Corp/corp-advert.js", []);
+    if (lines.length !== 3) throw new Error(`announce dedupe: logged ${lines.length}, want 3`);
+    return true;
 }
