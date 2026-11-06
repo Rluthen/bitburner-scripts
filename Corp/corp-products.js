@@ -18,7 +18,7 @@
  *   0 GB : hasCorporation nextUpdate
  *   10 GB: getCorporation getDivision getInvestmentOffer getProduct
  *   20 GB: discontinueProduct makeProduct
- *   => docs sum 80 GB + script base. Imports helpers.js (formatMoney, getConfiguration, instanceCount),
+ *   => docs sum 80 GB + script base. Imports helpers.js (formatMoney, getConfiguration),
  *      corp-lib.js (corpLog) and corp-formulas.js (allowedProductCeiling, nextProductName, parseProductId) -
  *      none of them references a corporation API, so they add nothing. Deliberately does NOT import
  *      Corp/corp-ops.js (that would charge this service the ~30-function union of the shared module).
@@ -32,8 +32,8 @@
  * Ported from catloversg/bitburner-scripts (MIT): corporationUtils.ts developNewProduct (1131-1196) and
  * corporation.ts (779-856) - logic only.
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { TOB_NAME, corpLog } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { TOB_NAME, alreadyRunning, corpLog } from "./corp-lib.js";
 import { allowedProductCeiling, nextProductName, parseProductId } from "./corp-formulas.js";
 
 const WARN_INTERVAL = 50; // re-log the same WARN / the profit skip at most once per this many cycles
@@ -66,7 +66,7 @@ function newMemory() {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const cfg = {
         productCity: String(options["product-city"]),

@@ -34,8 +34,8 @@
  * createDivision Chemical 3/2, both export routes, buyAdvert 8, optimizeStorageAndFactory, RP wait,
  * buyAdvert(max affordable), assignJobs, stockMaterials, waitForOffer(15, 10, 11e12)).
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { AGRI_NAME, CHEM_NAME, corpLog, getCities, offerMode, readBnProfile, scaledOfferExpect } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { AGRI_NAME, CHEM_NAME, alreadyRunning, corpLog, getCities, offerMode, readBnProfile, scaledOfferExpect } from "./corp-lib.js";
 import { bestStorageFactoryWarehouse, maxAffordableAdvertLevel, optimalBoostMaterials, ratiosToCounts, warehouseSize } from "./corp-formulas.js";
 import {
     acceptOffer,
@@ -252,7 +252,7 @@ async function run(ns, cfg) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const offerScale = Number(readBnProfile(ns).offerScale) || 1; // T08: the BitNode's CorporationValuation multiplier
     const cfg = {

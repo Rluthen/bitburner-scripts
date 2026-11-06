@@ -41,8 +41,8 @@
  * Run: `run Corp/corp-improve.js --division "Ebon Stick" --budget 1e12 --round 3`
  *      `run Corp/corp-improve.js --division "Dark Soil" --support --budget 30e9 --round 3`
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { BOOST_MATERIALS, OFFER_PREP_FILE, corpLog, getCities, runWorker } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { BOOST_MATERIALS, OFFER_PREP_FILE, alreadyRunning, corpLog, getCities, runWorker } from "./corp-lib.js";
 import {
     bestStorageFactoryWarehouse,
     maxAffordableLevel,
@@ -283,7 +283,7 @@ async function run(ns, cfg) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const cfg = {
         division: String(options.division),

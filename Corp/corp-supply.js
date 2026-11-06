@@ -29,7 +29,7 @@
  *   => docs sum 160 GB + script base. This service reads the game directly (the ticket's acceptance names this
  *      API set, so it does NOT take the 0 GB T04-snapshot shortcut - and the snapshot has neither per-city
  *      warehouses nor productionAmount). Imports corp-lib.js / corp-formulas.js (0 corporation APIs) and
- *      helpers.js (getConfiguration, instanceCount); deliberately does NOT import corp-ops.js (that shared
+ *      helpers.js (getConfiguration); deliberately does NOT import corp-ops.js (that shared
  *      module would charge the ~30-function union of its exports).
  * A city with no warehouse is detected by catching getWarehouse's documented throw ("<division> does not have a
  * warehouse in '<city>'") rather than paying 10 GB for hasWarehouse, which the ticket's API list leaves out.
@@ -38,8 +38,8 @@
  *       or let the daemon start it: run corp.js --custom-supply
  * Ported from catloversg/bitburner-scripts (MIT): corporationUtils.ts - logic only.
  */
-import { getConfiguration, instanceCount } from "../helpers.js";
-import { corpLog } from "./corp-lib.js";
+import { getConfiguration } from "../helpers.js";
+import { alreadyRunning, corpLog } from "./corp-lib.js";
 import { divisionRawProduction } from "./corp-formulas.js";
 
 const CONGESTION_LIMIT = 5; // §12.2: more than this many consecutive zero-output cycles ⇒ very likely congested
@@ -111,7 +111,7 @@ export function requiredInputMaterials({ coefficients, sizes, totalRawProduction
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return; // one instance only, like every other service
+    if (!options || alreadyRunning(ns)) return; // one instance only, like every other service
     ns.disableLog("ALL");
     const ctx = {
         dry: !!options.dry,

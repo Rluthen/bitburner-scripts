@@ -22,7 +22,7 @@
  *   10 GB: getIndustryData getMaterial getMaterialData getOffice getProduct
  *   20 GB: sellMaterial sellProduct setMaterialMarketTA2 setProductMarketTA2
  *   => docs sum 130 GB + script base. Imports corp-lib.js / corp-formulas.js (0 corporation APIs) and
- *      helpers.js (getConfiguration, instanceCount). Deliberately does NOT import Corp/corp-ops.js (importing
+ *      helpers.js (getConfiguration). Deliberately does NOT import Corp/corp-ops.js (importing
  *      it would charge this service the ~30-function union of that shared module).
  *
  * Guide refs: §16.2.1 p58 (PotentialSalesVolume), §16.2.2 p59 (markup multiplier ranges), §16.3 p60-62
@@ -33,8 +33,8 @@
  * Ported from catloversg/bitburner-scripts (MIT): corporationUtils.ts getOptimalSellingPrice /
  * setOptimalSellingPriceForEverything - logic only, with a measured MarkupLimit instead of its Ceres solver.
  */
-import { getConfiguration, instanceCount } from "../helpers.js";
-import { corpLog, STATE_FILE } from "./corp-lib.js";
+import { getConfiguration } from "../helpers.js";
+import { alreadyRunning, corpLog, STATE_FILE } from "./corp-lib.js";
 import { markupLimitFromMeasurement, optimalSellingPrice, potentialSalesVolume } from "./corp-formulas.js";
 
 const WARN_INTERVAL = 50; // re-log the same WARN at most once per this many sale windows (acceptance 3)
@@ -58,7 +58,7 @@ function newMemory() {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const mem = newMemory();
     const totals = { baseline: 0, ta2: 0, custom: 0 };

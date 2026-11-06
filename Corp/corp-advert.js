@@ -10,7 +10,7 @@
  *   10 GB: getCorporation getDivision getHireAdVertCost getHireAdVertCount getIndustryData getUpgradeLevel
  *   20 GB: hireAdVert levelUpgrade
  *   => 6 x 10 GB + 2 x 20 GB = 100 GB for the corporation API alone, on top of helpers.js (~16 GB for
- *      getConfiguration / instanceCount / formatMoney) and corp-lib.js / corp-formulas.js (0 corporation APIs).
+ *      getConfiguration / formatMoney) and corp-lib.js / corp-formulas.js (0 corporation APIs).
  *      Deliberately does NOT import Corp/corp-ops.js: that shared module would charge this job its whole
  *      getter/action union (~470 GB docs). The Wilson price is therefore computed with T02's formula, which
  *      is exactly the game's (Corporation/helpers.ts calculateUpgradeCost = base * mult^level for one level).
@@ -23,8 +23,8 @@
  * to 60%), §4.2 p19 (support divisions get no Advert after round 2 - this job only touches the product one).
  * Ported from catloversg/bitburner-scripts (MIT): corporation.ts buyWilsonAndAdvert (~707-731) - logic only.
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { TOB_NAME, corpLog } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { TOB_NAME, alreadyRunning, corpLog } from "./corp-lib.js";
 import { advertCost, bestWilsonAdvert, maxAffordableAdvertLevel, maxAffordableLevel, upgradeCost } from "./corp-formulas.js";
 
 const WILSON = "Wilson Analytics";
@@ -155,7 +155,7 @@ function run(ns, cfg) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const cfg = {
         budget: Number(options.budget),

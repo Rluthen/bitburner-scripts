@@ -32,8 +32,8 @@
  * corporation.ts round1 (createDivision, sellMaterial, buyAdvert 2, optimizeStorageAndFactory, RP wait,
  * assignJobs, stockMaterials, waitForOffer(10, 10, 490e9), acceptInvestmentOffer).
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { AGRI_NAME, CORPORATION_NAME, corpLog, getCities, offerMode, readBnProfile, scaledOfferExpect } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { AGRI_NAME, CORPORATION_NAME, alreadyRunning, corpLog, getCities, offerMode, readBnProfile, scaledOfferExpect } from "./corp-lib.js";
 import { bestStorageFactoryWarehouse, optimalBoostMaterials, warehouseSize } from "./corp-formulas.js";
 import {
     acceptOffer,
@@ -228,7 +228,7 @@ async function run(ns, cfg) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const customSupply = !!options["custom-supply"];
     const offerScale = Number(readBnProfile(ns).offerScale) || 1; // T08: the BitNode's CorporationValuation multiplier

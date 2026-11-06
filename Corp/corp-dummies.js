@@ -28,8 +28,8 @@
  *
  * Run: `run Corp/corp-dummies.js --budget 1e12`
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { BN_FILE, corpLog, getCities } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { BN_FILE, alreadyRunning, corpLog, getCities } from "./corp-lib.js";
 
 const DUMMY_PREFIX = "z-"; // reference `dummyDivisionNamePrefix`; T06 gates on names starting with "z-"
 const INDUSTRY = "Restaurant"; // §18.5 p71
@@ -149,7 +149,7 @@ function run(ns, cfg) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const cfg = {
         budget: Number(options.budget),

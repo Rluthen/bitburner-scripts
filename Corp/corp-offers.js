@@ -39,8 +39,8 @@
  * acceptInvestmentOffer) and switchAllOfficesToProfitSetup (994-1074, including the "reuse the main office
  * ratio but keep >= 1 employee in each of Operations/Engineer/Business" rule for the support offices).
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { BN_FILE, JOBS, OFFER_PREP_FILE, TOB_NAME, corpLog, offerMode, runWorker } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { BN_FILE, JOBS, OFFER_PREP_FILE, TOB_NAME, alreadyRunning, corpLog, offerMode, runWorker } from "./corp-lib.js";
 import { allowedProductCeiling, parseProductId, ratiosToCounts } from "./corp-formulas.js";
 
 const OFFICES_SCRIPT = "Corp/corp-offices.js"; // T19 (P4): restores the normal office setup after an offer
@@ -126,7 +126,7 @@ function newMemory() {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
 
     // Step 7: in BN8 (and any BN whose CorporationValuation is 0) every offer is worthless - stop the service.

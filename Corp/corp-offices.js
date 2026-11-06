@@ -22,8 +22,8 @@
  *      `run Corp/corp-offices.js --division "Ebon Stick" --budget 500e9 --mode product --round 3`
  *      (T18 launches it with the office share of its budget; T14 launches `--restore-normal` after an offer.)
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { JOBS, OFFER_PREP_FILE, STATE_FILE, corpLog, getCities } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { JOBS, OFFER_PREP_FILE, STATE_FILE, alreadyRunning, corpLog, getCities } from "./corp-lib.js";
 import { maxAffordableOfficeSize, officeUpgradeCost, ratiosToCounts } from "./corp-formulas.js";
 
 const SETTABLE_JOBS = Object.values(JOBS).filter((job) => job !== JOBS.none); // Unassigned is not settable
@@ -281,7 +281,7 @@ function run(ns, cfg) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const cfg = {
         division: String(options.division),

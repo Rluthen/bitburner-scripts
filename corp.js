@@ -19,8 +19,8 @@
  * Workers that do not exist yet are skipped with a WARN; the daemon never exits on a transient problem
  * (missing script, stale snapshot, low RAM). Only --help and a missing Source-File 3 stop it.
  */
-import { getConfiguration, getActiveSourceFiles, instanceCount, formatMoney, formatNumberShort } from "./helpers.js";
-import { CORP_LOG_PORT, LIFECYCLE_LOG, STATE_FILE, BN_FILE, offerMode, parseLogLine, runWorker } from "./Corp/corp-lib.js";
+import { getConfiguration, getActiveSourceFiles, formatMoney, formatNumberShort } from "./helpers.js";
+import { CORP_LOG_PORT, LIFECYCLE_LOG, STATE_FILE, BN_FILE, alreadyRunning, offerMode, parseLogLine, runWorker } from "./Corp/corp-lib.js";
 import { decide } from "./Corp/corp-rules.js";
 
 // These parameters are meant to let you tweak the script's behaviour from the command line (without altering source code)
@@ -67,7 +67,7 @@ export async function main(ns) {
 async function runDaemon(ns) {
     const opts = getConfiguration(ns, argsSchema);
     if (!opts) return; // --help or a bad argument (getConfiguration already logged why)
-    if ((await instanceCount(ns)) > 1) return; // never two daemons at once
+    if (alreadyRunning(ns)) return; // never two daemons at once
     const sf3 = (await getActiveSourceFiles(ns))[3] ?? 0; // BN3 counts as SF3 access by default
     if (sf3 === 0) {
         ns.tprint("ERROR: corp.js needs Source-File 3 (Corporation). Not unlocked - stopping.");

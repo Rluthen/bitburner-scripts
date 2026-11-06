@@ -29,13 +29,13 @@
  *   10 GB: getCorporation getInvestmentOffer getDivision hasResearched getResearchCost
  *   20 GB: research
  *   => docs sum 70 GB + script base. Imports corp-lib.js (0 corporation APIs) and helpers.js
- *      (getConfiguration, instanceCount). Deliberately does NOT import Corp/corp-ops.js: importing that shared
+ *      (getConfiguration). Deliberately does NOT import Corp/corp-ops.js: importing that shared
  *      module would charge this light service the ~30-function union of its exports.
  *
  * Run: `run Corp/corp-research.js` (or let the daemon start it from round 4 - T07 R_RESEARCH).
  */
-import { getConfiguration, instanceCount } from "../helpers.js";
-import { corpLog } from "./corp-lib.js";
+import { getConfiguration } from "../helpers.js";
+import { alreadyRunning, corpLog } from "./corp-lib.js";
 
 export const R_RND_LAB = "Hi-Tech R&D Laboratory";
 /** §6.3 p27-28 priority order for material (support) divisions (§18.1 p68 needs the lab first). **/
@@ -116,7 +116,7 @@ export function isDummy(divisionName) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return; // one instance only, like every other service
+    if (!options || alreadyRunning(ns)) return; // one instance only, like every other service
     ns.disableLog("ALL");
     const buyMarketTa = !!options["buy-market-ta"];
 

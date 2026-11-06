@@ -16,8 +16,8 @@
  * §19.1 (mandatory), FAQ p12 (recommended over wasting employees on Intern). Ported logic:
  * corporationUtils.ts buyTeaAndThrowParty (epsilon 0.5, party 500000, loop on nextUpdate).
  */
-import { getConfiguration, instanceCount } from "../helpers.js";
-import { corpLog, getCities, STATE_FILE } from "./corp-lib.js";
+import { getConfiguration } from "../helpers.js";
+import { alreadyRunning, corpLog, getCities, STATE_FILE } from "./corp-lib.js";
 
 const PARTY_COST = 500e3; // per employee, per party (§10.3); same for tea (game Constants teaCostPerEmployee)
 const TEA_COST = 500e3;
@@ -42,7 +42,7 @@ export function autocomplete(data, _) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const eps = Number(options.epsilon);
     const partyCost = Number(options["party-cost"]);

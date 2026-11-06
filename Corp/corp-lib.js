@@ -44,6 +44,18 @@ export function parseLogLine(line) {
   return { worker: line.slice(0, first), level: line.slice(first + 1, second), message: line.slice(second + 1) };
 }
 
+/** Duplicate-instance gate for every Corp worker (a backstop: the daemon already refuses to start a service
+ * twice). Deliberately NOT `instanceCount` from helpers.js: that helper runs a temp script through
+ * getNsDataThroughFile and returns **2** when the temp script could not start on a tight home
+ * (helpers.js:753, "insufficient RAM" - the same number it uses for "another instance is running"). Every
+ * caller's `> 1` then reads a RAM shortage as a duplicate and aborts, and the message it prints goes to
+ * ns.print/ns.tprint, NOT to the log port - so the worker exits having done nothing, the daemon's log shows
+ * nothing, and the launching job reports the run as a success. ns.ps is 0.2 GB and cannot be starved.
+ * @param {NS} ns @returns {boolean} true when another instance of THIS script is running **/
+export function alreadyRunning(ns) {
+  return ns.ps("home").filter((p) => p.filename === ns.getScriptName()).length > 1;
+}
+
 /** Launch a worker script on home, optionally waiting for it to finish.
  * @param {NS} ns @param {string} script @param {(string|number|boolean)[]} args @param {{wait?: boolean, threads?: number}} opts **/
 export async function runWorker(ns, script, args = [], { wait = true, threads = 1 } = {}) {
@@ -62,7 +74,13 @@ export async function runWorker(ns, script, args = [], { wait = true, threads = 
     return { ok: false, pid: 0, reason: "ram" };
   }
   const pid = ns.run(script, threads, ...args);
-  if (pid === 0) return { ok: false, pid: 0, reason: "launch" };
+  if (pid === 0) {
+    // The RAM check above passed and ns.run still refused: this is the one launch failure that would
+    // otherwise leave no trace at all (callers that ignore the result, e.g. corp-offers' restore, would
+    // look exactly like a successful run).
+    corpLog(ns, `worker ${script} did not start (ns.run returned 0 - home RAM changed during the launch)`, "WARN");
+    return { ok: false, pid: 0, reason: "launch" };
+  }
   if (wait) while (ns.isRunning(pid)) await ns.sleep(200);
   return { ok: true, pid };
 }
@@ -116,5 +134,12 @@ export function selfCheck() {
   if (offerMode(0.3) !== "GENERIC") throw new Error("offerMode x0.3 boundary");
   if (offerMode(1) !== "GENERIC") throw new Error("offerMode x1 (BN3)");
   if (offerMode(undefined) !== "GENERIC") throw new Error("offerMode missing profile");
+  // alreadyRunning: this instance is not a duplicate, another script's instance is not one either, two are.
+  const selfName = "Corp/corp-offices.js";
+  const psOf = (files) => ({ getScriptName: () => selfName, ps: () => files.map((filename) => ({ filename })) });
+  if (alreadyRunning(psOf([selfName]))) throw new Error("alreadyRunning: one instance is not a duplicate");
+  if (alreadyRunning(psOf(["Corp/corp-improve.js"]))) throw new Error("alreadyRunning: another script is not a duplicate");
+  if (alreadyRunning(psOf([]))) throw new Error("alreadyRunning: no instance is not a duplicate");
+  if (!alreadyRunning(psOf([selfName, selfName]))) throw new Error("alreadyRunning: two instances must be caught");
   return true;
 }

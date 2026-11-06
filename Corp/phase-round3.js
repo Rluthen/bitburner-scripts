@@ -37,8 +37,8 @@
  * improveProductDivision(funds*0.99 - 150e9 - 30e9 - 1e9), developNewProduct(..., 1e9), improveSupportDivision
  * 150e9/30e9, buyBoostMaterials).
  */
-import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { AGRI_NAME, CHEM_NAME, TOB_NAME, corpLog, getCities, readBnProfile, runWorker } from "./corp-lib.js";
+import { formatMoney, getConfiguration } from "../helpers.js";
+import { AGRI_NAME, CHEM_NAME, TOB_NAME, alreadyRunning, corpLog, getCities, readBnProfile, runWorker } from "./corp-lib.js";
 import { allowedProductCeiling, nextProductName, ratiosToCounts } from "./corp-formulas.js";
 import { assignJobs, ensureDivision, ensureUnlock, setBothExports } from "./corp-ops.js";
 
@@ -228,7 +228,7 @@ async function run(ns, cfg) {
 /** @param {NS} ns **/
 export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
-    if (!options || (await instanceCount(ns)) > 1) return;
+    if (!options || alreadyRunning(ns)) return;
     ns.disableLog("ALL");
     const cfg = {
         productCity: String(options["product-city"]),
