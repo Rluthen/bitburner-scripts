@@ -2,6 +2,9 @@ import {
     log, disableLogs, instanceCount, getConfiguration, getNsDataThroughFile, getActiveSourceFiles,
     getStocksValue, formatNumberShort, formatMoney, formatRam, getFilePath
 } from './helpers.js'
+// T04's corporation snapshot, written once per corporation cycle by Corp/corp-snapshot.js. The path lives in
+// exactly one place, so it comes from corp-lib.js (which references no ns.corporation API).
+import { STATE_FILE } from './Corp/corp-lib.js'
 
 const argsSchema = [
     ['show-peoplekilled', false],
@@ -191,6 +194,14 @@ async function getHudData(ns, bitNode, dictSourceFiles, options) {
         hudData.push(val)
     }
 
+    // Show the corporation (funds / profit / offer). The corp.js daemon prints this same healthcheck only
+    // once a minute, so the live readout lives here. 0 GB: reads T04's snapshot file, not ns.corporation.
+    {
+        let snap = null;
+        try { snap = JSON.parse(ns.read(STATE_FILE)); } catch { /* no snapshot yet: corp.js has not run */ }
+        for (const row of corpHudRows(snap)) hudData.push(row);
+    }
+
     // needed for gang and karma
     const gangInfo = await getGangInfo(ns);
 
@@ -366,3 +377,54 @@ const css = (rootStyle) => `<style id="statsCSS">
         background-color: ${rootStyle?.backgroundColor || "#900C"};
     }
 </style>`;
+
+const CORP_HUD_STALE_MS = 30_000; // snapshot older than this = the corporation daemon is not running: hide the rows
+
+/** Corporation HUD rows built from T04's snapshot (/Temp/corp-state.txt, ns.read = 0 GB).
+ *  Pure: selfCheck() pins the hidden / stale / live branches.
+ *  @param {object|null} snap parsed STATE_FILE @param {number} nowMs
+ *  @returns {HudRowConfig[]} the three rows, in display order **/
+export function corpHudRows(snap, nowMs = Date.now()) {
+    const rows = [["Corp Funds"], ["Corp Profit"], ["Corp Offer"]];
+    const live = snap?.hasCorp === true && !snap.error && typeof snap.t === 'number' && nowMs - snap.t <= CORP_HUD_STALE_MS;
+    if (!live) {
+        for (const row of rows) row.push(false); // hidden, but present: prepareHudElements() only builds rows it sees on the first tick
+        return rows;
+    }
+    const c = snap.corp ?? {};
+    const profit = c.profit ?? (c.revenue ?? 0) - (c.expenses ?? 0);
+    const source = `Corporation "${c.name}", read from ${STATE_FILE} (Corp/corp-snapshot.js refreshes it once per corporation cycle, ~10 s).`;
+    rows[0].push(true, formatMoney(c.funds ?? 0), `Corporation funds.\n${source}`);
+    rows[1].push(true, formatMoney(profit) + '/s', `Corporation revenue minus expenses per second - the number the corp.js log calls "profit".\n${source}`);
+    const o = snap.offer ?? {};
+    rows[2].push(true, o.funds > 0 ? `r${o.round} ${formatMoney(o.funds)}` : 'no offer',
+        `Investment offer currently on the table (round ${o.round ?? '-'}, ${formatMoney(o.funds ?? 0)}).\n${source}`);
+    return rows;
+}
+
+/** Offline check of the corporation HUD rows. Run:
+ *   node --input-type=module -e "import('./stats.js').then(m=>m.selfCheck()).then(()=>console.log('stats.js selfCheck ok'))"
+ * Proves the hide / stale / live branches and the row ids only - NOT in-game HUD behaviour. **/
+export function selfCheck() {
+    const ids = (rows) => rows.map((r) => makeID(r[0]));
+    const now = 1_700_000_000_000;
+    if (corpHudRows({ t: now, hasCorp: false }, now).some((r) => r[1] !== false))
+        throw new Error('corpHudRows: no corporation must hide every row');
+    if (corpHudRows({ t: 0, hasCorp: true, corp: { funds: 1 }, offer: {} }, 60_000).some((r) => r[1] !== false))
+        throw new Error('corpHudRows: a stale snapshot must hide every row');
+    if (corpHudRows({ t: now, hasCorp: true, error: 'boom' }, now).some((r) => r[1] !== false))
+        throw new Error('corpHudRows: a failed snapshot must hide every row');
+    const snap = { t: now, hasCorp: true, corp: { name: 'Erebos', funds: 12.676e9, revenue: 2e7, expenses: 2.6e6 }, offer: { funds: 4.647e12, round: 2 } };
+    const rows = corpHudRows(snap, now);
+    if (rows.length !== 3 || rows.some((r) => r[1] !== true)) throw new Error(`corpHudRows: a live snapshot shows 3 rows, got ${JSON.stringify(rows)}`);
+    if (rows[0][2] !== formatMoney(12.676e9)) throw new Error(`funds row: ${rows[0][2]}`);
+    if (rows[1][2] !== formatMoney(17.4e6) + '/s') throw new Error(`profit row: ${rows[1][2]}`);
+    if (rows[2][2] !== `r2 ${formatMoney(4.647e12)}`) throw new Error(`offer row: ${rows[2][2]}`);
+    const offline = corpHudRows({ t: now, hasCorp: true, corp: { funds: 0 }, offer: { funds: 0, round: 3 } }, now);
+    if (offline[2][2] !== 'no offer') throw new Error(`no-offer row: ${offline[2][2]}`);
+    // Ids must be unique: updateHudElement() looks rows up by id (a duplicate silently writes the wrong row).
+    if (new Set(ids(rows)).size !== 3) throw new Error(`duplicate HUD ids: ${ids(rows).join(',')}`);
+    if (ids(rows).some((id) => ['Reserve', 'Stock', 'Hashes', 'BitNode'].includes(id)))
+        throw new Error(`HUD id collides with an existing row: ${ids(rows).join(',')}`);
+    return true;
+}

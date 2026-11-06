@@ -10,9 +10,11 @@
  *
  * Run it:   run corp.js --dry-run    (do this first: it decides and logs, starts nothing but the read-only readers)
  * Then:     run corp.js              (services keep running; spending jobs run one at a time)
- * Options:  --product-city, --mat-ratio, --custom-supply, --improve-every, --dry-run, --pause
+ * Options:  --product-city, --mat-ratio, --custom-supply, --improve-every, --dry-run, --pause, --verbose, --debug
  * Stop it:  `kill corp.js`  (services/jobs it started keep running; `kill <name>` each if you want)
  * History:  corp.lifecycle.log.txt (next to this script) holds every printed line after the tail scrolls
+ * HUD:      the per-cycle healthcheck prints at most once a minute; funds / profit / offer are read live
+ *           from the T04 snapshot by stats.js
  *
  * Workers that do not exist yet are skipped with a WARN; the daemon never exits on a transient problem
  * (missing script, stale snapshot, low RAM). Only --help and a missing Source-File 3 stop it.
@@ -30,10 +32,13 @@ const argsSchema = [
     ["tobacco-min", 500e9], // LOW mode only: funds at which Tobacco may start a round early (guide writer: "Tobacco is fine with >1t investment, 500b may be good enough")
     ["dry-run", false], // decide and LOG, never launch
     ["pause", false], // keep logging / status but launch nothing
+    ["verbose", false], // print the healthcheck status line every cycle (default: at most once a minute)
+    ["debug", false], // alias of --verbose - either bare flag forces full logging
 ];
 
 const PROFIT_MILESTONES = Array.from({ length: 28 }, (_, i) => 10 ** (9 + 3 * i)); // 1e9 .. 1e90
 const SNAPSHOT_FRESH_MS = 30_000; // a snapshot older than this is stale (bonus time can stretch a cycle)
+const STATUS_EVERY_MS = 60_000; // the healthcheck line: at most one per minute in the tail (--verbose/--debug: every cycle)
 
 export function autocomplete(data, _) {
     data.flags(argsSchema);
@@ -87,9 +92,11 @@ async function runDaemon(ns) {
             productCity: String(opts["product-city"]),
             matRatio: Number(opts["mat-ratio"]),
             dryRun: !!opts["dry-run"],
+            verbose: !!opts["verbose"] || !!opts["debug"], // healthcheck: once a minute unless either flag is set
         },
         installed: new Set(), // Corp/*.js present on home, refreshed each cycle
         lastJobCycle: {}, // per-script launch cycle (T06 cadence)
+        lastStatusMs: 0, // wall clock of the last healthcheck line printed to the tail (statusDue throttle)
         job: null, // the one job we started: { script, pid }
         launchHistory: [], // { script, cycle, phase } - for the looping-job guard
         halted: false, // set when a job loops; user must restart the daemon
@@ -275,8 +282,18 @@ const anyFinished = (state) =>
 const finishedProducts = (state) =>
     Object.values(state.divisions ?? {}).flatMap((d) => (d.products ?? []).filter((p) => p.developmentProgress >= 100).map((p) => p.name));
 
-/** One INFO status line per cycle. **/
-function statusLine(ns, ctx, state, plan) {
+/** Should the per-cycle healthcheck line be printed to THIS tail window? Pure, so selfCheck() pins it.
+ *  Worker lines, WARN notes and MILESTONEs are event-driven and always print - the status line is the only
+ *  per-cycle spam. The lifecycle log gets the line either way (see statusLine()).
+ *  @param {number} lastMs when it was last printed (0 = never) @param {number} nowMs wall clock
+ *  @param {boolean} verbose @param {number} intervalMs @returns {boolean} **/
+export function statusDue(lastMs, nowMs, verbose, intervalMs = STATUS_EVERY_MS) {
+    return !!verbose || nowMs - lastMs >= intervalMs;
+}
+
+/** One INFO status line per cycle: to the TAIL at most once a minute (--verbose/--debug: every cycle), but
+ *  always to the lifecycle log, so the on-disk history stays a complete per-cycle debug dump. **/
+export function statusLine(ns, ctx, state, plan) {
     const c = state.corp ?? {};
     const profit = c.profit ?? (c.revenue ?? 0) - (c.expenses ?? 0);
     const offer = state.offer && state.offer.funds > 0 ? `offer r${state.offer.round} ${formatMoney(state.offer.funds)}` : "no offer";
@@ -284,11 +301,15 @@ function statusLine(ns, ctx, state, plan) {
     const svc = ctx.runningServices.length ? ctx.runningServices.map(basename).join(",") : "-";
     const job = ctx.job ? `job=${basename(ctx.job.script)} pid=${ctx.job.pid}` : plan.job ? `job=due(${basename(plan.job.script)})` : "job=-";
     const elapsed = ((Date.now() - ctx.started) / 60000).toFixed(1);
-    emit(
-        ns,
-        `${stamp()} c${ctx.cycle} +${elapsed}m [${plan.phase}] funds ${formatMoney(c.funds ?? 0)} ` +
-            `profit ${formatMoney(profit)}/s ${offer} divs ${divs} svc ${svc} ${job}`,
-    );
+    const text = `${stamp()} c${ctx.cycle} +${elapsed}m [${plan.phase}] funds ${formatMoney(c.funds ?? 0)} ` +
+        `profit ${formatMoney(profit)}/s ${offer} divs ${divs} svc ${svc} ${job}`;
+    const now = Date.now();
+    if (statusDue(ctx.lastStatusMs, now, ctx.options.verbose)) {
+        ctx.lastStatusMs = now;
+        emit(ns, text); // tail + lifecycle log
+    } else {
+        append(ns, text); // tail stays quiet; the lifecycle log still gets the whole per-cycle history
+    }
 }
 
 /** Print MISSING notes immediately when they change, and remind every 20 cycles (T06 behaviour). **/
@@ -462,5 +483,29 @@ export function selfCheck() {
     announce(ns, ctx, "DRYRUN would start", "Corp/corp-advert.js", []); // dedupes per (tag, script)
     announce(ns, ctx, "DRYRUN would start", "Corp/corp-advert.js", []);
     if (lines.length !== 3) throw new Error(`announce dedupe: logged ${lines.length}, want 3`);
+    // statusDue: the healthcheck prints once a minute, or every cycle under --verbose/--debug.
+    if (!statusDue(0, 1_000, true)) throw new Error("statusDue: --verbose must always be due");
+    if (!statusDue(0, 60_000, false)) throw new Error("statusDue: first line after a minute");
+    if (statusDue(0, 59_999, false)) throw new Error("statusDue: must wait a full minute");
+    if (statusDue(1_000, 60_999, false)) throw new Error("statusDue: 59.999 s after the last print");
+    if (!statusDue(1_000, 61_000, false)) throw new Error("statusDue: exactly 60 s after the last print");
+    // statusLine: throttled in the tail, whole in the lifecycle log. Fake ns (print = tail, write = the log file).
+    const tail = [], logLines = [];
+    const ns2 = { print: (t) => tail.push(String(t)), write: (_f, d) => logLines.push(String(d)), tprint: () => {}, toast: () => {} };
+    const opts2 = { verbose: false };
+    const ctx2 = { cycle: 7, phase: "R2", started: Date.now(), lastStatusMs: Date.now(), runningServices: [], job: null, options: opts2 };
+    const st2 = { corp: { funds: 12.676e9, profit: 17.4e6 }, offer: { funds: 4.647e12, round: 2 }, divisions: { a: {}, b: {} } };
+    const plan2 = { phase: "R2", job: null, services: [], notes: [] };
+    statusLine(ns2, ctx2, st2, plan2);
+    if (tail.length !== 0 || logLines.length !== 1) throw new Error(`statusLine throttled: tail=${tail.length} log=${logLines.length}, want 0/1`);
+    ctx2.lastStatusMs = Date.now() - 61_000; // a minute and a second later: due again
+    statusLine(ns2, ctx2, st2, plan2);
+    if (tail.length !== 1 || logLines.length !== 2) throw new Error(`statusLine due: tail=${tail.length} log=${logLines.length}, want 1/2`);
+    if (!tail[0].includes("funds $12.676b") || !tail[0].includes("profit $17.400m/s") || !tail[0].includes("offer r2 $4.647t"))
+        throw new Error(`statusLine numbers changed: ${tail[0]}`);
+    if (!tail[0].includes("divs 2 svc - job=-")) throw new Error(`statusLine tail fields changed: ${tail[0]}`);
+    opts2.verbose = true;
+    statusLine(ns2, ctx2, st2, plan2);
+    if (tail.length !== 2 || logLines.length !== 3) throw new Error(`statusLine --verbose: tail=${tail.length} log=${logLines.length}, want 2/3`);
     return true;
 }
