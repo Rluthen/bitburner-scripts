@@ -38,6 +38,44 @@ export function autocomplete(data, args) {
     return [];
 }
 
+export const CORPORATION_SELF_FUND_COST = 150e9; // stable helpers.ts costOfCreatingCorporation(false); mirrors Corp/phase-round1.js
+
+/** Pure: what should autopilot do about the corporation on this check?
+ *  `liquidate` = sell the portfolio now, `launch` = start corp.js now, `unavailable` = this BN cannot create one.
+ *  @param {{corpRunning: boolean, hasCorp: boolean, funding: boolean, canSeed: boolean, canSelfFund: boolean, cash: number, stocks: number}} s */
+export function corporationPlan({ corpRunning, hasCorp, funding, canSeed, canSelfFund, cash, stocks }) {
+    if (corpRunning) return { liquidate: false, launch: false, unavailable: false }; // already handing off
+    if (hasCorp) return { liquidate: false, launch: true, unavailable: false }; // manager died: restart it, never re-fund
+    if (!canSeed && !canSelfFund) return { liquidate: false, launch: false, unavailable: true };
+    if (canSeed || cash >= CORPORATION_SELF_FUND_COST) return { liquidate: false, launch: true, unavailable: false };
+    // Sell only once: after the sale the latch (`funding`) stays on until the corporation exists, so a
+    // shortfall cannot become sell -> re-buy -> sell churn.
+    if (!funding && cash + stocks >= CORPORATION_SELF_FUND_COST) return { liquidate: true, launch: false, unavailable: false };
+    return { liquidate: false, launch: false, unavailable: false }; // still saving
+}
+
+/** Offline check for the pure decision above: node --input-type=module -e "import('./autopilot.js').then(m => m.selfCheck())" */
+export function selfCheck() {
+    const eq = (got, want, label) => {
+        if (JSON.stringify(got) !== JSON.stringify(want))
+            throw new Error(`${label}: ${JSON.stringify(got)} != ${JSON.stringify(want)}`);
+    };
+    const base = { corpRunning: false, hasCorp: false, funding: false, canSeed: false, canSelfFund: true, cash: 10e9, stocks: 140e9 };
+    const none = { liquidate: false, launch: false, unavailable: false };
+    eq(corporationPlan(base), { liquidate: true, launch: false, unavailable: false }, "portfolio can fund the seed");
+    eq(corporationPlan({ ...base, cash: 150e9, stocks: 0 }), { liquidate: false, launch: true, unavailable: false }, "cash alone is enough");
+    eq(corporationPlan({ ...base, cash: 149.999e9, stocks: 0 }), none, "one dollar short: keep saving");
+    eq(corporationPlan({ ...base, cash: 0, stocks: 0 }), none, "nothing to sell yet");
+    eq(corporationPlan({ ...base, funding: true }), none, "never sell the same portfolio twice");
+    eq(corporationPlan({ ...base, funding: true, cash: 140e9, stocks: 0 }), none, "short after selling: keep saving, never re-buy");
+    eq(corporationPlan({ ...base, funding: true, cash: 150e9, stocks: 0 }), { liquidate: false, launch: true, unavailable: false }, "shortfall closed by income");
+    eq(corporationPlan({ ...base, canSeed: true, cash: 0, stocks: 0 }), { liquidate: false, launch: true, unavailable: false }, "BN3 seed needs no money");
+    eq(corporationPlan({ ...base, hasCorp: true, cash: 0, stocks: 0 }), { liquidate: false, launch: true, unavailable: false }, "restart a dead manager");
+    eq(corporationPlan({ ...base, corpRunning: true, cash: 150e9 }), none, "manager already running");
+    eq(corporationPlan({ ...base, canSelfFund: false }), { liquidate: false, launch: false, unavailable: true }, "this BN cannot create one");
+    return true;
+}
+
 /** The entire program is now wrapped in the main functino to avoid objects in
  * global shared memory surviving between multiple invocations of this script.
  * @param {NS} ns **/
@@ -91,6 +129,7 @@ export async function main(ns) {
     let alreadyJoinedDaedalus = false, autoJoinDaedalusUnavailable = false, reservingMoneyForDaedalus = false, disableStockmasterForDaedalus = false; // Flags to indicate that we should be keeping 100b cash on hand to earn an invite to Daedalus
     let prioritizeHackForDaedalus = false, prioritizeHackForWd = false;
     let lastScriptsCheck = 0; // Last time we got a listing of all running scripts
+    let fundingCorporation = false; // True from the first portfolio sale until a corporation exists; keeps stockmaster offline meanwhile
     let homeRam = 0; // Amount of RAM on the home server, last we checked
     let killScripts = []; // A list of scripts flagged to be restarted due to changes in priority
     let dictOwnedSourceFiles = (/**@returns{{[k: number]: number;}}*/() => [])(); // Player owned source files
@@ -247,7 +286,7 @@ export async function main(ns) {
         await checkOnDaedalusStatus(ns, player, stocksValue);
         await checkIfBnIsComplete(ns, player);
         await maybeAcceptStaneksGift(ns, player);
-        await checkOnRunningScripts(ns, player);
+        await checkOnRunningScripts(ns, player, stocksValue);
         await maybeDoCasino(ns, player);
         await maybeInstallAugmentations(ns, player);
         return shouldWeKeepRunning(ns); // Return false to shut down autopilot.js if we installed augs, or don't have enough home RAM
@@ -500,10 +539,66 @@ export async function main(ns) {
         return false;
     }
 
+    /** Hand the player's wealth over to the corporation once one can be created. Mirrors the Daedalus
+     * liquidation above: sell the portfolio with stockmaster's own --liquidate flag, keep the trader offline,
+     * and let corp.js (which owns creation: free seed in BN3, otherwise $150e9 self-funded) do the creating.
+     * @param {NS} ns
+     * @param {Player} player
+     * @param {number} stocksValue
+     * @param {(baseScriptName: string, filter?: (value: ProcessInfo, index: number, array: ProcessInfo[]) => unknown) => ProcessInfo} findScript
+     * @returns {Promise<boolean>} true if it acted this check */
+    async function maybeStartCorporation(ns, player, stocksValue, findScript) {
+        if (!(3 in unlockedSFs)) { // corp.js needs SF3 (BN3 counts as SF3 access); don't freeze stocks for nothing
+            log_once(ns, 'INFO: Skipping corporation startup: no Source-File 3 (Corporation) access.', true);
+            return false;
+        }
+        const hasCorp = ns.corporation.hasCorporation(); // 0 GB
+        const canSeed = ns.corporation.canCreateCorporation(false) === 'Success'; // 0 GB
+        const canSelfFund = ns.corporation.canCreateCorporation(true) === 'Success'; // 0 GB
+        const plan = corporationPlan({
+            corpRunning: !!findScript('corp.js'), hasCorp, funding: fundingCorporation,
+            canSeed, canSelfFund, cash: player.money, stocks: stocksValue,
+        });
+        if (plan.unavailable) {
+            log_once(ns, 'INFO: This BitNode cannot start a corporation (canCreateCorporation was not "Success") - skipping.', true);
+            return false;
+        }
+        if (plan.liquidate) {
+            fundingCorporation = true; // Set BEFORE any await: the trader must not restart mid-sale
+            setStatus(ns, `Selling the stock portfolio to fund the corporation's ${formatMoney(CORPORATION_SELF_FUND_COST)} seed...`);
+            log(ns, `INFO: Liquidating stocks for corporation startup (cash ${formatMoney(player.money)}, stocks ${formatMoney(stocksValue)})...`, true, 'info');
+            const pid = launchScriptHelper(ns, 'stockmaster.js', ['--liquidate']); // Bare boolean flag - never `--liquidate true`
+            if (pid) await waitForProcessToComplete(ns, pid, true); // Reuse the existing waiter; stockmaster exits when done
+            else log(ns, 'ERROR: Could not launch stockmaster.js --liquidate; will retry next check.', true, 'error');
+            return true;
+        }
+        if (!plan.launch) {
+            if (!fundingCorporation) // While funding, the status line above already explains the wait
+                setStatus(ns, `Saving for a corporation: ${formatMoney(player.money)} cash + ${formatMoney(stocksValue)} stocks of ${formatMoney(CORPORATION_SELF_FUND_COST)}.`);
+            return false;
+        }
+        // Re-read cash after a sale so we never start the corporation on stale numbers
+        const cash = hasCorp ? player.money : (await getPlayerInfo(ns)).money; // RAM-dodged; already used by the main loop
+        if (!hasCorp && !canSeed && cash < CORPORATION_SELF_FUND_COST) {
+            setStatus(ns, `Corporation seed ${formatMoney(CORPORATION_SELF_FUND_COST)}: sold the portfolio for ${formatMoney(cash)}, waiting for income to close the gap.`);
+            return false; // fundingCorporation stays true: no re-buying with the seed money
+        }
+        const pid = launchScriptHelper(ns, 'corp.js', []); // No args: corp.js.config.txt and its own defaults win
+        if (!pid) {
+            log(ns, 'WARNING: corp.js did not start (missing file or not enough free home RAM). The seed money stays held and ' +
+                'stock trading stays paused; install it / free RAM, or kill autopilot.js to release it.', true, 'warning');
+            return false;
+        }
+        fundingCorporation = false;
+        setStatus(ns, `Corporation startup handed off to corp.js; resuming normal progression.`);
+        return true;
+    }
+
     /** Logic to ensure scripts are running to progress the BN
      * @param {NS} ns
-     * @param {Player} player */
-    async function checkOnRunningScripts(ns, player) {
+     * @param {Player} player
+     * @param {number} stocksValue */
+    async function checkOnRunningScripts(ns, player, stocksValue) {
         if (lastScriptsCheck > Date.now() - options['interval-check-scripts']) return;
         lastScriptsCheck = Date.now();
         const runningScripts = await getRunningScripts(ns); // Cache the list of running scripts for the duration
@@ -517,8 +612,16 @@ export async function main(ns) {
         // See if home ram has improved. We hold back on launching certain scripts if we are low on home RAM
         homeRam = await getNsDataThroughFile(ns, `ns.getServerMaxRam(ns.args[0])`, null, ["home"]);
 
+        // Release the stock trader as soon as a corporation exists, however it was created
+        if (fundingCorporation && ns.corporation.hasCorporation()) fundingCorporation = false;
+
+        // Start the corporation before other discretionary spending: sell the portfolio for the seed, then hand off
+        // to corp.js (which owns creation: free seed in BN3, otherwise $150e9 self-funded).
+        await maybeStartCorporation(ns, player, stocksValue, findScript);
+
         // Launch stock-master in a way that emphasizes it as our main source of income early-on
-        if (!findScript('stockmaster.js') && !disableStockmasterForDaedalus && homeRam >= 32)
+        // (but not while we are raising or holding the corporation's seed money)
+        if (!findScript('stockmaster.js') && !disableStockmasterForDaedalus && !fundingCorporation && homeRam >= 32)
             launchScriptHelper(ns, 'stockmaster.js', [
                 "--fracH", resetInfo.currentNode == 8 ? 0.001 : 0.1, // Fraction of wealth to keep as cash (10% - unless in BN8)
                 "--reserve", 0, // Override to ignore the global reserve.txt. Any money we reserve can more or less safely live as stocks
@@ -631,6 +734,9 @@ export async function main(ns) {
             }
             // Prevent daemon from starting "work-for-faction.js" since we now manage that script
             daemonArgs.push('--disable-script', getFilePath('work-for-factions.js'));
+            // Autopilot is the single owner of the stock trader, so it can hold the portfolio out of the way while
+            // the corporation's seed is raised - same hand-off as work-for-factions right above.
+            daemonArgs.push('--disable-script', getFilePath('stockmaster.js'));
             // In BN8, always run in a mode that prioritizes stock market manipulation
             if (resetInfo.currentNode == 8) daemonArgs.push("--stock-manipulation-focus");
             // Don't run the script to join and manage bladeburner if it is explicitly disabled
