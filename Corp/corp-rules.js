@@ -112,6 +112,7 @@ function pickJob(state, ctx, phase, opts, { divisions, round, funds, profit }) {
     const last = (script) => ctx.lastJobCycle?.[script] ?? -Infinity;
     const relaunchable = (script) => ctx.cycle - last(script) >= PHASE_RELAUNCH;
     const productCity = opts.productCity ?? "Sector-12";
+    const matRatio = opts.matRatio ?? 0.8;
 
     if (phase === "R1") {
         if (!relaunchable(R_R1)) return null;
@@ -149,13 +150,13 @@ function pickJob(state, ctx, phase, opts, { divisions, round, funds, profit }) {
         {
             due: ctx.cycle % SUPPORT_CADENCE[CHEM_NAME] === 0 && tobRevenue && chemBudget >= 1e9,
             script: R_IMPROVE,
-            args: ["--division", CHEM_NAME, "--support", "--budget", String(chemBudget), "--round", String(round)],
+            args: ["--division", CHEM_NAME, "--support", "--budget", String(chemBudget), "--round", String(round), "--mat-ratio", String(matRatio)],
             reason: `support division ${CHEM_NAME} (every ${SUPPORT_CADENCE[CHEM_NAME]} cycles)`,
         },
         {
             due: ctx.cycle % SUPPORT_CADENCE[AGRI_NAME] === 0 && tobRevenue && agriBudget >= 1e9,
             script: R_IMPROVE,
-            args: ["--division", AGRI_NAME, "--support", "--budget", String(agriBudget), "--round", String(round)],
+            args: ["--division", AGRI_NAME, "--support", "--budget", String(agriBudget), "--round", String(round), "--mat-ratio", String(matRatio)],
             reason: `support division ${AGRI_NAME} (every ${SUPPORT_CADENCE[AGRI_NAME]} cycles)`,
         },
         {
@@ -173,7 +174,7 @@ function pickJob(state, ctx, phase, opts, { divisions, round, funds, profit }) {
         {
             due: due(R_IMPROVE) && (tobRevenue || round <= 3) && plan.improveBudget > 0,
             script: R_IMPROVE,
-            args: ["--division", TOB_NAME, "--budget", String(plan.improveBudget), "--round", String(round)],
+            args: ["--division", TOB_NAME, "--budget", String(plan.improveBudget), "--round", String(round), "--mat-ratio", String(matRatio), "--product-city", productCity],
             reason: `improve product division ${TOB_NAME} + corporation upgrades`,
         },
     ];
@@ -265,6 +266,16 @@ export function selfCheck() {
     // 6. research service gated on offer.round >= 4
     ok(!scripts(decide(withTob(3), fakeCtx())).includes(R_RESEARCH), "no research in round 3");
     ok(scripts(decide(withTob(4), fakeCtx())).includes(R_RESEARCH), "research in round 4");
+
+    // 7. The GROW improve job carries the daemon's own --mat-ratio / --product-city. Without them corp-improve and
+    //    corp-offices silently fall back to 0.8 / Sector-12, so `run corp.js --mat-ratio 0.5` would only half apply.
+    const grown = decide(
+        withTob(3),
+        fakeCtx({ installed: new Set([R_IMPROVE]), lastJobCycle: { "Corp/corp-advert.js": 1 }, options: { ...fakeCtx().options, productCity: "Aevum", matRatio: 0.5 } }),
+    );
+    eq(grown.job?.script, R_IMPROVE, "GROW picks the improve job once advert is not due");
+    eq(grown.job.args[grown.job.args.indexOf("--mat-ratio") + 1], "0.5", "improve gets --mat-ratio");
+    eq(grown.job.args[grown.job.args.indexOf("--product-city") + 1], "Aevum", "improve gets --product-city");
 
     return true;
 }

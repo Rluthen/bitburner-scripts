@@ -8,7 +8,7 @@
  * Statically-referenced corporation APIs (docs figure, NOT measured - both are 0 GB, so the daemon
  * stays small on any home): nextUpdate, hasCorporation. Every other value arrives via the snapshot.
  *
- * Run it:   run corp.js --dry-run    (do this first: it decides and logs, but launches nothing)
+ * Run it:   run corp.js --dry-run    (do this first: it decides and logs, starts nothing but the read-only readers)
  * Then:     run corp.js              (services keep running; spending jobs run one at a time)
  * Options:  --product-city, --mat-ratio, --custom-supply, --improve-every, --dry-run, --pause
  * Stop it:  `kill corp.js`  (services/jobs it started keep running; `kill <name>` each if you want)

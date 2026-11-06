@@ -210,6 +210,11 @@ export async function runCycle(ns, cfg, mem) {
     const gate = offerGate(products, offerRound);
     if (gate.open || (newest !== null && newest.developmentProgress > PREP_PROGRESS_LOW && newest.developmentProgress < 100)) {
         writeFlag(ns, OFFER_PREP_FILE, "1");
+    } else {
+        // The imminent-offer condition ended without an accept. Round 4 develops several products, so the newest
+        // one leaving its last 2% (or being replaced) must NOT latch the flag: T18 would skip that division's
+        // offices for the rest of the round. writeFlag() compares first, so this costs one 0 GB read per cycle.
+        writeFlag(ns, OFFER_PREP_FILE, "0");
     }
     if (!gate.open) {
         warnOnce(
@@ -563,6 +568,12 @@ export async function selfCheck() {
     r = await run(fakeState({ products: [product("Ebon Stick-00000-1.00000e+9", 99)] }));
     must(r.ns.calls.accept === 0 && r.ns.files[OFFER_PREP_FILE] === "1", `pre-accept flag: ${r.ns.files[OFFER_PREP_FILE]}`);
     must(!r.ns.lines.some((l) => l.includes("refused")), "a developing product is not an offer error");
+
+    // ...and the flag must not LATCH: once the newest product is out of its last 2% without an accept (round 4
+    // develops several products), the next cycle clears it - otherwise T18/T19 freeze that division's offices
+    // for the whole round. Starting run reads the flag left by the run above.
+    r = await run(fakeState({ products: [product("Ebon Stick-00000-1.00000e+9", 42)], prepFlag: "1" }));
+    must(r.ns.files[OFFER_PREP_FILE] === "0", `stale prep flag cleared: ${r.ns.files[OFFER_PREP_FILE]}`);
 
     // A finished product whose effectiveRating is still 0 waits one more cycle (reference 792).
     r = await run(fakeState({ products: [product("Ebon Stick-00000-1.00000e+9", 100, 0)] }));

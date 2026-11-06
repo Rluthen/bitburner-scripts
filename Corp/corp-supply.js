@@ -26,7 +26,7 @@
  *   10 GB: getCorporation getDivision getIndustryData getMaterialData getWarehouse getOffice getMaterial
  *          getProduct getUpgradeLevel hasResearched
  *   20 GB: buyMaterial sellMaterial setSmartSupply
- *   => docs sum 150 GB + script base. This service reads the game directly (the ticket's acceptance names this
+ *   => docs sum 160 GB + script base. This service reads the game directly (the ticket's acceptance names this
  *      API set, so it does NOT take the 0 GB T04-snapshot shortcut - and the snapshot has neither per-city
  *      warehouses nor productionAmount). Imports corp-lib.js / corp-formulas.js (0 corporation APIs) and
  *      helpers.js (getConfiguration, instanceCount); deliberately does NOT import corp-ops.js (that shared
