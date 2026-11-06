@@ -67,6 +67,37 @@ export async function runWorker(ns, script, args = [], { wait = true, threads = 
   return { ok: true, pid };
 }
 
+/** Expected investment offer for a phase in the CURRENT BitNode. The guide's numbers are BN3, and offers scale
+ * with the BitNode's CorporationValuation (guide §17.3 p64), so an unscaled floor refuses every offer a x0.2
+ * BitNode (BN6/BN7) can ever produce. `override` (an explicit --offer-expect) is absolute. Pure - checked below.
+ * @param {number} base the guide's/reference's BN3 expectation @param {number} offerScale T08's profile.offerScale
+ * @param {number|null} override @returns {number} **/
+export function scaledOfferExpect(base, offerScale, override) {
+  return override == null ? base * (Number(offerScale) || 1) : Number(override);
+}
+
+/** Where the BN3 round plan stops working. Guide-writer feedback: "~0.3-0.4 valuation or higher: just follow
+ * generic advices. For 0.1-0.2 valuation: use strategy for BN13 ... You need to write your script in a way
+ * that it aims for a 'condition', not a number." Below this multiplier the offers are ~1/5 of the guide's
+ * numbers while every purchase keeps its BN3 price, so the round plan moves one round later and each offer is
+ * taken at whatever amount it reaches. Pure - checked below. **/
+export const LOW_OFFER_SCALE = 0.3;
+
+/** @param {number} offerScale T08's profile.offerScale (= CorporationValuation) @returns {"LOW"|"GENERIC"} **/
+export function offerMode(offerScale) {
+  return Number(offerScale) < LOW_OFFER_SCALE ? "LOW" : "GENERIC";
+}
+
+/** T08's BitNode profile out of /Temp/corp-bn.txt (0 GB read). A missing or corrupt file means `{}`, i.e.
+ * every caller falls back to its own BN3 default - the same behaviour the phase jobs had before this. **/
+export function readBnProfile(ns) {
+  try {
+    return JSON.parse(ns.read(BN_FILE)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
 /** Self-check for the pure parts. Run with node: see report. Throws on failure. **/
 export function selfCheck() {
   const p = parseLogLine("phase-round1|MILESTONE|Accepted offer 551.9b");
@@ -76,5 +107,14 @@ export function selfCheck() {
   if (!(q.worker === "w" && q.level === "ERROR" && q.message === "a|b|c"))
     throw new Error("parseLogLine pipes in message");
   if (CORP_LOG_PORT !== 3003) throw new Error("port");
+  if (scaledOfferExpect(340e9, 1, null) !== 340e9) throw new Error("scaledOfferExpect BN3");
+  if (Math.abs(scaledOfferExpect(340e9, 0.2, null) - 68e9) > 1) throw new Error("scaledOfferExpect BN6/7");
+  if (scaledOfferExpect(340e9, 0.2, 5e11) !== 5e11) throw new Error("scaledOfferExpect explicit --offer-expect");
+  if (scaledOfferExpect(11e12, undefined, null) !== 11e12) throw new Error("scaledOfferExpect missing profile");
+  if (offerMode(0.2) !== "LOW") throw new Error("offerMode x0.2 (BN6/BN7)");
+  if (offerMode(0.001) !== "LOW") throw new Error("offerMode x0.001 (BN13)");
+  if (offerMode(0.3) !== "GENERIC") throw new Error("offerMode x0.3 boundary");
+  if (offerMode(1) !== "GENERIC") throw new Error("offerMode x1 (BN3)");
+  if (offerMode(undefined) !== "GENERIC") throw new Error("offerMode missing profile");
   return true;
 }

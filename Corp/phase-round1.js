@@ -33,7 +33,7 @@
  * assignJobs, stockMaterials, waitForOffer(10, 10, 490e9), acceptInvestmentOffer).
  */
 import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { AGRI_NAME, BN_FILE, CORPORATION_NAME, corpLog, getCities } from "./corp-lib.js";
+import { AGRI_NAME, CORPORATION_NAME, corpLog, getCities, offerMode, readBnProfile, scaledOfferExpect } from "./corp-lib.js";
 import { bestStorageFactoryWarehouse, optimalBoostMaterials, warehouseSize } from "./corp-formulas.js";
 import {
     acceptOffer,
@@ -59,8 +59,11 @@ const ADVERT_TARGET = 2; // §4.1/§19.2: buy 2 Advert levels in this round
 const SELF_FUND_COST = 150e9; // stable helpers.ts costOfCreatingCorporation(false); 50e9 only on a restart
 const OFFER_INIT_CYCLES = 10; // reference waitForOffer(10, 10, ...) - the offer peaks after ~10 production cycles
 const OFFER_EXTRA_CYCLES = 10;
-// Guide §19.1 offer means: 551.164e9 with a custom Smart Supply script (the reference's 490e9 expectation),
-// 340.413e9 with the built-in one. 490e9 is the ticket's number and is only reachable on the custom path.
+// Guide §19.1 offer means (BN3 numbers): 551.164e9 with a custom Smart Supply script (the reference's 490e9
+// expectation), 340.413e9 with the built-in one. 490e9 is the ticket's number and is only reachable on the
+// custom path. Both are multiplied by the BitNode's CorporationValuation multiplier (T08 offerScale) below:
+// offers scale with it (§17.3 p64), so e.g. BN6/BN7 (x0.2) peak at ~68e9 and the 0.8 accept floor must move
+// with them - otherwise the phase refuses its own best offer forever.
 const OFFER_EXPECT_CUSTOM = 490e9;
 const OFFER_EXPECT_BUILTIN = 340e9;
 
@@ -78,13 +81,9 @@ export function autocomplete(data, _) {
 }
 
 /** One context line out of T08's profile (/Temp/corp-bn.txt). A missing file is fine - canCreateCorporation
- * is the real gate. */
+ * is the real gate. **/
 function bnNote(ns) {
-    try {
-        return JSON.parse(ns.read(BN_FILE))?.note ?? "no BN profile";
-    } catch {
-        return "no BN profile";
-    }
+    return readBnProfile(ns).note ?? "no BN profile";
 }
 
 /** Step 1: make sure a corporation exists. Seed money only where the game allows it (BN3); otherwise
@@ -232,14 +231,18 @@ export async function main(ns) {
     if (!options || (await instanceCount(ns)) > 1) return;
     ns.disableLog("ALL");
     const customSupply = !!options["custom-supply"];
+    const offerScale = Number(readBnProfile(ns).offerScale) || 1; // T08: the BitNode's CorporationValuation multiplier
     const cfg = {
         customSupply: customSupply,
         selfFund: !!options["self-fund"],
         matRatio: Number(options["mat-ratio"]),
-        offerExpect: options["offer-expect"] == null ? (customSupply ? OFFER_EXPECT_CUSTOM : OFFER_EXPECT_BUILTIN) : Number(options["offer-expect"]),
+        // --offer-expect is an absolute override; the defaults are the guide's BN3 means scaled by the BitNode.
+        // A LOW-valuation node cannot reach those means at all ("don't aim for a specific number" - the guide
+        // writer), so there the offer is taken at whatever amount it reaches; see offerMode in corp-lib.
+        offerExpect: offerMode(offerScale) === "LOW" ? 0 : scaledOfferExpect(customSupply ? OFFER_EXPECT_CUSTOM : OFFER_EXPECT_BUILTIN, offerScale, options["offer-expect"]),
         reserve: options.reserve == null ? Number(ns.read("reserve.txt") || 0) : Number(options.reserve),
     };
-    corpLog(ns, `round 1 starting (custom-supply=${cfg.customSupply}, mat-ratio=${cfg.matRatio}, offer-expect=${formatMoney(cfg.offerExpect)})`);
+    corpLog(ns, `round 1 starting (custom-supply=${cfg.customSupply}, mat-ratio=${cfg.matRatio}, offer-expect=${formatMoney(cfg.offerExpect)} @ BN valuation x${offerScale})`);
     try {
         await run(ns, cfg);
     } catch (e) {

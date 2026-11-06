@@ -40,7 +40,7 @@
  * ratio but keep >= 1 employee in each of Operations/Engineer/Business" rule for the support offices).
  */
 import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { BN_FILE, JOBS, OFFER_PREP_FILE, TOB_NAME, corpLog, runWorker } from "./corp-lib.js";
+import { BN_FILE, JOBS, OFFER_PREP_FILE, TOB_NAME, corpLog, offerMode, runWorker } from "./corp-lib.js";
 import { allowedProductCeiling, parseProductId, ratiosToCounts } from "./corp-formulas.js";
 
 const OFFICES_SCRIPT = "Corp/corp-offices.js"; // T19 (P4): restores the normal office setup after an offer
@@ -97,14 +97,19 @@ export function profitOfficeJobs(ratio, size) {
 /** The 1P/2P gate, pure: for rounds 3/4 the round's product count must be reached AND every product finished
  * (T13 develops one at a time and stops at the ceiling; T14 accepts the offer). `products` are the division's
  * product objects ({name, developmentProgress}). A name without a generated id still occupies a slot, so the
- * count is compared both ways (same rule as T13). **/
-export function offerGate(products, offerRound) {
+ * count is compared both ways (same rule as T13).
+ *
+ * LOW mode: the product COUNT is a money-driven BN3 optimization (1 product in round 3, 2 in round 4), which a
+ * low-offer node cannot pay for, so the gate drops it and opens as soon as nothing is mid-development. The
+ * phase tables guarantee this service only runs with the round's product division already in place. **/
+export function offerGate(products, offerRound, mode = "GENERIC") {
     const ceiling = allowedProductCeiling(offerRound);
     const named = products.map((p) => parseProductId(p.name)).filter(Number.isFinite);
     const developed = named.length === 0 ? 0 : Math.max(...named) + 1;
     const count = Math.max(developed, products.length);
     const allFinished = products.length > 0 && products.every((p) => p.developmentProgress >= 100);
-    return { open: count >= ceiling && allFinished, developed: count, ceiling, allFinished };
+    const open = mode === "LOW" ? products.length === 0 || allFinished : count >= ceiling && allFinished;
+    return { open, developed: count, ceiling, allFinished };
 }
 
 /** Session memory of the running service. Every decision is re-derived from the game, so a restart costs
@@ -132,6 +137,7 @@ export async function main(ns) {
         profile = null;
     }
     const offerScale = Number(profile?.offerScale ?? 1);
+    const mode = offerMode(offerScale); // LOW on a BitNode whose CorporationValuation is < 0.3, see corp-lib
 
     const cfg = {
         productCity: String(options["product-city"]),
@@ -139,6 +145,7 @@ export async function main(ns) {
         goPublic: options["go-public"] !== false,
         minFraction: Number(options["min-fraction"]),
         offerScale: offerScale,
+        mode: mode,
         division: TOB_NAME,
     };
     if (!(offerScale > 0)) {
@@ -148,7 +155,7 @@ export async function main(ns) {
     const mem = newMemory();
     corpLog(
         ns,
-        `offer service starting (division=${cfg.division}, product-city=${cfg.productCity}, offerScale=${offerScale}, go-public=${cfg.goPublic}, dividend-rate=${cfg.dividendRate}, min-fraction=${cfg.minFraction})`,
+        `offer service starting (division=${cfg.division}, product-city=${cfg.productCity}, offerScale=${offerScale}, mode=${mode}, go-public=${cfg.goPublic}, dividend-rate=${cfg.dividendRate}, min-fraction=${cfg.minFraction})`,
     );
 
     while (true) {
@@ -207,7 +214,7 @@ export async function runCycle(ns, cfg, mem) {
     // Step 2: the 1P/2P gate. Step 3: the pre-accept signal - while the newest product is in its last 2% or
     // while we are already preparing to accept, OFFER_PREP_FILE is "1" so T19 leaves the product division's
     // office jobs alone (the reference's documented race, corporation.ts 688-690). Cleared in step 5.
-    const gate = offerGate(products, offerRound);
+    const gate = offerGate(products, offerRound, cfg.mode);
     if (gate.open || (newest !== null && newest.developmentProgress > PREP_PROGRESS_LOW && newest.developmentProgress < 100)) {
         writeFlag(ns, OFFER_PREP_FILE, "1");
     } else {
@@ -236,7 +243,9 @@ export async function runCycle(ns, cfg, mem) {
     // Step 4: switch the product division to the "profit" setup (main office + support offices), then let the
     // offer grow (it is driven by the last cycles' profit) and accept it.
     applyProfitSetup(ns, division, cfg.productCity, offerRound);
-    const expected = expectedOfferFor(offerRound, cfg.offerScale);
+    // LOW: no amount is targeted (the guide writer: on such a node the offer is a fraction of the guide's
+    // number) - the peak wait above is the whole condition and acceptOffer(0) takes whatever is on the table.
+    const expected = cfg.mode === "LOW" ? 0 : expectedOfferFor(offerRound, cfg.offerScale);
     await waitForOffer(ns, OFFER_WAIT_CYCLES, OFFER_WAIT_EXTRA, expected); // lets the offer grow on the profit setup
     if (!acceptOffer(ns, offerRound, expected, cfg.minFraction)) return; // below the floor: retry next cycle
     mem.accepted.add(offerRound);
@@ -309,14 +318,25 @@ function assignOfficeJobs(ns, division, city, jobs) {
     return ok;
 }
 
+/** Wait for `n` WHOLE corporation cycles (a cycle = the 5 states, nextUpdate() resolves per STATE) - the
+ * reference's waitForNumberOfCycles counts a state RECURRING, so raw nextUpdate() calls are 5x too short. **/
+async function waitForCycles(ns, n) {
+    for (let i = 0; i < n; i++) {
+        const state = ns.corporation.getCorporation().prevState;
+        do {
+            await ns.corporation.nextUpdate();
+        } while (ns.corporation.getCorporation().prevState !== state);
+    }
+}
+
 /** Inline port of Corp/corp-ops.js waitForOffer: let the current offer grow for initCycles, then up to
  * maxExtraCycles more while it keeps rising by >= 0.1% per cycle. @returns {number} funds left on the table **/
 async function waitForOffer(ns, initCycles, maxExtraCycles, expectedFunds) {
     const funds = () => ns.corporation.getInvestmentOffer().funds;
-    for (let i = 0; i < initCycles; i++) await ns.corporation.nextUpdate();
+    await waitForCycles(ns, initCycles);
     let offer = funds();
     for (let i = 0; i < maxExtraCycles; i++) {
-        await ns.corporation.nextUpdate();
+        await waitForCycles(ns, 1);
         const now = funds();
         if (i % 2 === 0) corpLog(ns, `offer ${formatMoney(now)}`);
         if (now < offer * 1.001) break; // it stopped growing - take what is on the table
@@ -494,7 +514,7 @@ function fakeState({ products = [], ...rest } = {}) {
     };
 }
 
-const CFG = { productCity: "Sector-12", dividendRate: 0.5, goPublic: true, minFraction: 0.8, offerScale: 1, division: TOB_NAME };
+const CFG = { productCity: "Sector-12", dividendRate: 0.5, goPublic: true, minFraction: 0.8, offerScale: 1, mode: "GENERIC", division: TOB_NAME };
 
 /** Runnable check (no game needed):
  *   node --input-type=module -e "import('./Corp/corp-offers.js').then(m=>m.selfCheck()).then(r=>console.log('selfCheck:',r))"
@@ -508,6 +528,19 @@ export async function selfCheck() {
         const ns = mockNs(state);
         return runCycle(ns, cfg, mem).then(() => ({ ns, mem }));
     };
+
+    // offerGate per mode: GENERIC waits for the round's product COUNT (1P in round 3, 2P in round 4), LOW only
+    // for "nothing is mid-development" - the count is a BN3 optimization a low-offer node cannot pay for, and
+    // on such a node round 3 has no product division at all (Chemical is round 3's investment there).
+    const midProduct = { name: `${TOB_NAME}-00000-1.00000e+9`, developmentProgress: 40 };
+    const doneProduct = { name: `${TOB_NAME}-00000-1.00000e+9`, developmentProgress: 100 };
+    const doneSecond = { name: `${TOB_NAME}-00001-1.00000e+9`, developmentProgress: 100 };
+    must(offerGate([], 3, "LOW").open, "LOW round 3 with no products accepts on the peak alone");
+    must(!offerGate([midProduct], 4, "LOW").open, "LOW round 4 waits for its product to finish");
+    must(offerGate([doneProduct], 4, "LOW").open, "LOW round 4 accepts one finished product");
+    must(!offerGate([doneProduct], 4, "GENERIC").open, "GENERIC round 4 still wants 2 products");
+    must(offerGate([doneProduct, doneSecond], 4, "GENERIC").open, "GENERIC round 4 accepts 2 finished products");
+    must(offerGate([], 3).open === false, "default mode stays GENERIC");
 
     // Acceptance 1, verbatim: ratiosToCounts(profitRatio(round), size) on the ratio table's own denominators.
     same(ratiosToCounts(profitRatio(3), 138), [49, 5, 51, 33], "ratiosToCounts(profitRatio(3), 138)");

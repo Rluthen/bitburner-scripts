@@ -18,7 +18,7 @@
  * (missing script, stale snapshot, low RAM). Only --help and a missing Source-File 3 stop it.
  */
 import { getConfiguration, getActiveSourceFiles, instanceCount, formatMoney, formatNumberShort } from "./helpers.js";
-import { CORP_LOG_PORT, LIFECYCLE_LOG, STATE_FILE, BN_FILE, parseLogLine, runWorker } from "./Corp/corp-lib.js";
+import { CORP_LOG_PORT, LIFECYCLE_LOG, STATE_FILE, BN_FILE, offerMode, parseLogLine, runWorker } from "./Corp/corp-lib.js";
 import { decide } from "./Corp/corp-rules.js";
 
 // These parameters are meant to let you tweak the script's behaviour from the command line (without altering source code)
@@ -27,6 +27,7 @@ const argsSchema = [
     ["mat-ratio", 0.8], // % of each warehouse used for boost materials (round 3+ default)
     ["custom-supply", false], // start Corp/corp-supply.js instead of the built-in Smart Supply (T16)
     ["improve-every", 5], // cycles between improve / advert jobs
+    ["tobacco-min", 500e9], // LOW mode only: funds at which Tobacco may start a round early (guide writer: "Tobacco is fine with >1t investment, 500b may be good enough")
     ["dry-run", false], // decide and LOG, never launch
     ["pause", false], // keep logging / status but launch nothing
 ];
@@ -77,6 +78,10 @@ async function runDaemon(ns) {
         started: Date.now(),
         options: {
             improveEvery: Number(opts["improve-every"]),
+            // Derived state, like advertShare: the mode is read from T08's profile once at startup (see
+            // startup()) and it is what selects the LOW round table over the generic one in Corp/corp-rules.js.
+            mode: "GENERIC",
+            tobaccoMin: Number(opts["tobacco-min"]),
             advertShare: 0.2,
             customSupply: !!opts["custom-supply"],
             productCity: String(opts["product-city"]),
@@ -171,8 +176,11 @@ function round1StartState() {
 /** Run the snapshot worker (the ONLY expensive reader, T04) and parse its JSON.
  * Returns null when it is missing, unparseable or older than SNAPSHOT_FRESH_MS. **/
 async function readSnapshot(ns, ctx) {
-    const res = await launch(ns, ctx, "Corp/corp-snapshot.js", [], true);
-    if (!res.ok) return null;
+    // The worker is the only expensive reader (T04). When it cannot start - a spending job holds the home RAM,
+    // which is exactly when the daemon is most likely to be asked what to do next - the previous file is still
+    // good inside SNAPSHOT_FRESH_MS, so fall through to it instead of going blind for the cycle. launch()
+    // already warned once about the shortage.
+    await launch(ns, ctx, "Corp/corp-snapshot.js", [], true);
     let snap;
     try {
         snap = JSON.parse(ns.read(STATE_FILE));
@@ -310,7 +318,10 @@ async function startup(ns, ctx) {
     } catch {
         return warnOnce(ns, ctx, `could not read ${BN_FILE}`);
     }
-    logLine(ns, ctx, "INFO", `BitNode profile: ${bn.note ?? JSON.stringify(bn)} - viable=${bn.viable}`);
+    // T08's CorporationValuation multiplier picks the round table in Corp/corp-rules.js: below 0.3 (0.1-0.2,
+    // BN13) every offer is taken at whatever it is worth instead of aiming at the guide's BN3 numbers.
+    ctx.options.mode = offerMode(bn.offerScale);
+    logLine(ns, ctx, "INFO", `BitNode profile: ${bn.note ?? JSON.stringify(bn)} - viable=${bn.viable}, mode=${ctx.options.mode}`);
     if (bn.viable === false) {
         ctx.bnViable = false;
         logLine(ns, ctx, "ERROR", "this BitNode does not allow a viable corporation - observe-only (no jobs)");
@@ -339,7 +350,12 @@ function drainLog(ns, ctx) {
         ns.print(text);
         append(ns, text);
         if (level === "ERROR") ns.tprint(text);
-        if (level === "MILESTONE") ns.toast(message, "success");
+        // A MILESTONE from a worker (offer accepted, division created) is the line the player must not miss,
+        // and they are rare - put it in the terminal too; a toast is gone before it can be read.
+        if (level === "MILESTONE") {
+            ns.tprint(text);
+            ns.toast(message, "success");
+        }
     }
 }
 
@@ -396,7 +412,10 @@ function logLine(ns, ctx, level, message) {
     const text = `${stamp()} c${ctx.cycle} [${ctx.phase}] daemon ${level}: ${message}`;
     emit(ns, text);
     if (level === "ERROR") ns.tprint(text);
-    if (level === "MILESTONE") ns.toast(message, "success");
+    if (level === "MILESTONE") {
+        ns.tprint(text); // a milestone the terminal never shows is why "it went to R2 with no evidence"
+        ns.toast(message, "success");
+    }
 }
 
 const mile = (ns, ctx, message) => logLine(ns, ctx, "MILESTONE", message);

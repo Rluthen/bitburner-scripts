@@ -36,20 +36,41 @@ const R_R2 = "Corp/phase-round2.js";
 const R_R3 = "Corp/phase-round3.js";
 
 const MAX_DIVISIONS = 20; // BN3 max (§2 FAQ p10); other BNs use T08's maxDivisions
+// LOW mode only: the guide writer's "find a point that it's better to start creating Tobacco ... Tobacco is
+// fine with >1t investment, 500b may be good enough" - his own guess, hence an option on corp.js, not a rule.
+const TOBACCO_MIN_DEFAULT = 500e9;
 const DUMMY_DIVISION_COST = 55e9; // 10e9 (Restaurant) + 5*4e9 offices + 5*5e9 warehouses (T20; Sector-12's office AND warehouse are created free with the division)
 const PHASE_RELAUNCH = 5; // don't hammer a phase job that just exited (job rule 1)
 const SUPPORT_CADENCE = { [AGRI_NAME]: 10, [CHEM_NAME]: 15 }; // §19.4.2 p77 / reference corporation.ts 923-944
 
 /** Which phase the corporation is in. Uses offer.round (getCorporation() has no round field, T04).
  * @param {object} state parsed /Temp/corp-state.txt
- * @returns {"NO_CORP"|"R1"|"R2"|"R3_SETUP"|"GROW"|"PUBLIC"} **/
-export function detectPhase(state) {
+ * @param {"LOW"|"GENERIC"} [mode] T08's offerMode - LOW is a BitNode whose CorporationValuation is < 0.3
+ * @param {number} [tobaccoMin] LOW only: funds at which Tobacco may move a round earlier
+ * @returns {"NO_CORP"|"R1"|"R2"|"R3_SETUP"|"GROW"|"PUBLIC"|"LOW_AGRI"|"LOW_CHEM"|"LOW_TOB"} **/
+export function detectPhase(state, mode = "GENERIC", tobaccoMin = TOBACCO_MIN_DEFAULT) {
     if (!state?.hasCorp) return "NO_CORP";
     if (state.corp?.public) return "PUBLIC";
     const divisions = state.divisions ?? {};
     if (!divisions[AGRI_NAME]) return "R1"; // no Agriculture yet
     const round = state.offer?.round ?? 0;
     if (round === 1) return "R1"; // Agriculture exists, offer 1 not accepted yet
+    // LOW: the offer is ~1/5 of the guide's number while every purchase keeps its BN3 price, so the round plan
+    // moves one round later (guide-writer feedback: round 1/2 Agriculture, round 3 Chemical, round 4 Tobacco,
+    // taking each offer at whatever it is worth). Every phase job accepts at offerExpect 0, so the rounds still
+    // advance in order; nothing here needs a product division before round 3, so T14 is untouched.
+    if (mode === "LOW") {
+        if (round === 2) return "LOW_AGRI"; // invest Agriculture, take offer 2
+        if (round === 3) {
+            if (!divisions[CHEM_NAME]) return "LOW_CHEM"; // Chemical IS round 3's investment on such a node
+            if (divisions[TOB_NAME]) return "GROW";
+            // "find a point that it's better to start creating Tobacco ... Tobacco is fine with >1t
+            // investment, 500b may be good enough" - a rich low-node corp is effectively a generic one.
+            return (state.corp?.funds ?? 0) >= tobaccoMin ? "LOW_TOB" : "LOW_CHEM";
+        }
+        if (round === 4) return divisions[TOB_NAME] ? "GROW" : "LOW_TOB";
+        return "GROW"; // all four offers taken
+    }
     if (round === 2) return "R2"; // Chemical not created yet OR created, waiting for offer 2
     if (round >= 3 && !divisions[TOB_NAME]) return "R3_SETUP";
     return "GROW"; // round 3/4 pending, or all four accepted (T14 decides going public)
@@ -74,7 +95,8 @@ export function spendPlan(state, opts = {}) {
  * @returns {{phase:string, services:{script:string,args:any[]}[], job:{script:string,args:any[],reason:string}|null, notes:string[]}} **/
 export function decide(state, ctx) {
     const opts = ctx.options ?? {};
-    const phase = detectPhase(state);
+    const mode = opts.mode ?? "GENERIC";
+    const phase = detectPhase(state, mode, opts.tobaccoMin);
     const notes = [];
     if (!state?.hasCorp) return { phase, services: [], job: null, notes };
 
@@ -91,7 +113,10 @@ export function decide(state, ctx) {
     if (anyFinished || phase === "GROW" || phase === "PUBLIC")
         services.push({ script: R_PRICING, args: ["--product-city", productCity] });
     if (phase === "GROW" || phase === "PUBLIC") {
-        services.push({ script: R_PRODUCTS, args: ["--product-city", productCity] });
+        // LOW: the phase jobs develop the first product themselves, and T14/offerGate then wants nothing
+        // mid-development - a second product in round 4 would both cost money a low-offer node does not have
+        // and delay offer 4 until it finishes. T13 starts once the offers are gone (round 5).
+        if (!(mode === "LOW" && round < 5)) services.push({ script: R_PRODUCTS, args: ["--product-city", productCity] });
         services.push({ script: R_OFFERS, args: ["--product-city", productCity] });
         if (round >= 4) services.push({ script: R_RESEARCH, args: [] }); // §19.4.2 p79: no research in round 3
     }
@@ -119,6 +144,20 @@ function pickJob(state, ctx, phase, opts, { divisions, round, funds, profit }) {
         const args = ["--mat-ratio", String(opts.matRatio ?? 0.8)];
         if (opts.customSupply) args.push("--custom-supply");
         return { script: R_R1, args, reason: "round 1: create corporation + Agriculture, accept offer 1" };
+    }
+    // LOW (CorporationValuation < 0.3): the same three jobs, one round later - and no offer amount is
+    // targeted, since the phase jobs read the mode from T08's profile themselves and accept at expect 0.
+    if (phase === "LOW_AGRI") {
+        if (!relaunchable(R_R2)) return null;
+        return { script: R_R2, args: ["--agri-only"], reason: "low-offer round 2: invest Agriculture, take offer 2" };
+    }
+    if (phase === "LOW_CHEM") {
+        if (!relaunchable(R_R2)) return null;
+        return { script: R_R2, args: [], reason: "low-offer round 3: Chemical + Agriculture, take offer 3" };
+    }
+    if (phase === "LOW_TOB") {
+        if (!relaunchable(R_R3)) return null;
+        return { script: R_R3, args: ["--product-city", productCity], reason: "low-offer Tobacco setup, then take the offer" };
     }
     if (phase === "R2") {
         if (!relaunchable(R_R2)) return null;
@@ -212,7 +251,7 @@ function fakeCtx(o = {}) {
         installed: new Set(),
         runningJob: false,
         lastJobCycle: {},
-        options: { improveEvery: 5, advertShare: 0.2, customSupply: false, productCity: "Sector-12", matRatio: 0.8, dryRun: false },
+        options: { improveEvery: 5, advertShare: 0.2, customSupply: false, productCity: "Sector-12", matRatio: 0.8, dryRun: false, mode: "GENERIC", tobaccoMin: 500e9 },
         ...o,
     };
 }
@@ -276,6 +315,32 @@ export function selfCheck() {
     eq(grown.job?.script, R_IMPROVE, "GROW picks the improve job once advert is not due");
     eq(grown.job.args[grown.job.args.indexOf("--mat-ratio") + 1], "0.5", "improve gets --mat-ratio");
     eq(grown.job.args[grown.job.args.indexOf("--product-city") + 1], "Aevum", "improve gets --product-city");
+
+    // 8. LOW mode (CorporationValuation < 0.3): the guide writer's ladder - each round invests in one thing and
+    //    takes whatever offer is on the table, so the whole plan moves one round later and T13 stays off until
+    //    the offers are gone.
+    const lowCtx = (o = {}) => fakeCtx({ installed: new Set([R_R2, R_R3]), options: { ...fakeCtx().options, mode: "LOW" }, ...o });
+    const agriState = fakeState({ divisions: { [AGRI_NAME]: div() }, offer: { round: 2 }, corp: { funds: 1e9 } });
+    eq(detectPhase(agriState, "LOW"), "LOW_AGRI", "LOW round 2 phase");
+    eq(decide(agriState, lowCtx()).job?.script, R_R2, "LOW round 2 job");
+    eq(decide(agriState, lowCtx()).job.args.includes("--agri-only"), true, "LOW round 2 runs --agri-only");
+
+    const noChem = fakeState({ divisions: { [AGRI_NAME]: div() }, offer: { round: 3 }, corp: { funds: 1e9 } });
+    eq(detectPhase(noChem, "LOW"), "LOW_CHEM", "LOW round 3 without Chemical");
+    eq(detectPhase(noChem), "R3_SETUP", "GENERIC unchanged: round 3 without Tobacco is R3_SETUP");
+    eq(decide(noChem, lowCtx()).job?.script, R_R2, "LOW round 3 runs the Chemical phase");
+    eq(decide(noChem, lowCtx()).job.args.includes("--agri-only"), false, "LOW round 3 runs the full body");
+
+    const chemOnly = fakeState({ divisions: { [AGRI_NAME]: div(), [CHEM_NAME]: div() }, offer: { round: 3 }, corp: { funds: 1e9 } });
+    eq(detectPhase(chemOnly, "LOW"), "LOW_CHEM", "LOW round 3, Chemical done, funds under the knob");
+    eq(detectPhase(chemOnly, "LOW", 1e9), "LOW_TOB", "LOW round 3, funds at the --tobacco-min knob");
+    eq(detectPhase(withTob(3), "LOW"), "GROW", "LOW round 3 with Tobacco already exists");
+
+    const noTob = fakeState({ divisions: { [AGRI_NAME]: div(), [CHEM_NAME]: div() }, offer: { round: 4 }, corp: { funds: 1e9 } });
+    eq(detectPhase(noTob, "LOW"), "LOW_TOB", "LOW round 4 without Tobacco");
+    eq(decide(noTob, lowCtx()).job?.script, R_R3, "LOW round 4 runs the Tobacco setup");
+    ok(!scripts(decide(withTob(4), lowCtx())).includes(R_PRODUCTS), "LOW round 4: no T13 before the offers are gone");
+    ok(scripts(decide(withTob(5), lowCtx())).includes(R_PRODUCTS), "LOW round 5: T13 runs again");
 
     return true;
 }

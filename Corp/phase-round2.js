@@ -35,8 +35,8 @@
  * buyAdvert(max affordable), assignJobs, stockMaterials, waitForOffer(15, 10, 11e12)).
  */
 import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { AGRI_NAME, CHEM_NAME, corpLog, getCities } from "./corp-lib.js";
-import { bestStorageFactoryWarehouse, maxAffordableAdvertLevel, optimalBoostMaterials, warehouseSize } from "./corp-formulas.js";
+import { AGRI_NAME, CHEM_NAME, corpLog, getCities, offerMode, readBnProfile, scaledOfferExpect } from "./corp-lib.js";
+import { bestStorageFactoryWarehouse, maxAffordableAdvertLevel, optimalBoostMaterials, ratiosToCounts, warehouseSize } from "./corp-formulas.js";
 import {
     acceptOffer,
     assignJobs,
@@ -62,11 +62,17 @@ const CHEM_WAREHOUSE_LEVEL = 2; // §19.3.1: Chemical warehouse level 2 (~6.9e9 
 const ADVERT_TARGET = 8; // §19.3.1: Advert 8 for Agriculture, none for Chemical
 const JOBS_AGRI = { Operations: 3, Engineer: 1, Business: 2, Management: 2, "Research & Development": 0 };
 const JOBS_CHEM = { Operations: 1, Engineer: 1, Business: 1, "Research & Development": 0 };
+// Round 1's job mix, restored only while this round waits for the Chemical division to become affordable:
+// production comes from Ops/Eng/Mgmt (§9.1.1 getDivisionRawProduction returns 0 when they are all 0), so an
+// office left entirely on R&D earns nothing and the round would never become affordable.
+const JOBS_WHILE_WAITING = { Operations: 1, Engineer: 1, Business: 1, Management: 1, "Research & Development": 0 };
 const OFFER_INIT_CYCLES = 15; // reference round2 waitForOffer(15, 10, 11e12)
 const OFFER_EXTRA_CYCLES = 10;
+const ROUND2_OFFER_EXPECT = 11e12; // the reference's round-2 expectation; a BN3 number, scaled by T08's offerScale
 
 const argsSchema = [
-    ["offer-expect", 11e12], // reference round2's expectation; the guide prints 14.1-14.9e12 (CONTEXT §6)
+    ["agri-only", false], // LOW mode's round 2: invest only in Agriculture and take offer 2 (no Export, no Chemical)
+    ["offer-expect", null], // null => 11e12 (the reference's round-2 number) x the BitNode's offerScale (0 in LOW mode); the guide prints 14.1-14.9e12 (CONTEXT §6)
     ["agri-ratio", 0.76], // §8.6: fraction of an Agriculture warehouse used for boost materials (4522/5950)
     ["chem-ratio", 0.95], // §8.6: same for Chemical (665/700)
     ["rp-agri", 700], // §19.3.1: "waiting for 700 RP in Agriculture is enough"
@@ -76,6 +82,23 @@ const argsSchema = [
 export function autocomplete(data, _) {
     data.flags(argsSchema);
     return [];
+}
+
+// Order of the Ops/Eng/Biz/Mgmt mixes used below. R&D is deliberately not part of a production mix
+// (production is Ops+Eng+Mgmt, §9.1.1); setAllOnRnd() is what puts an office on research.
+const PRODUCTION_JOB_ORDER = ["Operations", "Engineer", "Business", "Management"];
+
+/** Put every office on a job mix scaled to the office's ACTUAL size. setJobAssignment takes an ABSOLUTE count
+ * and throws when there are not enough Unassigned employees, so asking a size-4 office for JOBS_AGRI's 8
+ * employees failed once per city - which is what happens on any node that cannot afford to grow the office
+ * to 8 (and in an --agri-only round). R&D is zeroed: an office left entirely on R&D produces nothing. **/
+function assignProductionJobs(ns, division, cities, jobs) {
+    const total = PRODUCTION_JOB_ORDER.reduce((sum, job) => sum + (jobs[job] ?? 0), 0) || 1;
+    const ratio = PRODUCTION_JOB_ORDER.map((job) => (jobs[job] ?? 0) / total);
+    for (const city of cities) {
+        const counts = ratiosToCounts(ratio, ns.corporation.getOffice(division, city).size);
+        assignJobs(ns, division, city, Object.fromEntries(PRODUCTION_JOB_ORDER.map((job, i) => [job, counts[i]])));
+    }
 }
 
 /** The four boost factors of an industry, in the fixed [AI Cores, Hardware, Real Estate, Robots] order.
@@ -125,19 +148,19 @@ function buyStoragePlan(ns, cities, factors, cfg) {
 }
 
 /** Step 8: stock the boost materials at the §8.3.2 optimum for each division's ACTUAL warehouse space
- * (warehouseSize(level, Smart Storage) * that division's mat-ratio). The two divisions are stocked one after
- * the other, never with Promise.all: T03's stockBoostMaterials awaits nextUpdate() internally. **/
-async function stockBoost(ns, cities, agriFactors, chemFactors, cfg) {
+ * (warehouseSize(level, Smart Storage) * that division's mat-ratio). `parts` is a [division, factors, ratio]
+ * list, so the caller decides which divisions exist: an --agri-only round has no Chemical division yet and
+ * getWarehouse would THROW for it. Stocked one after the other, never with Promise.all: T03's
+ * stockBoostMaterials awaits nextUpdate() internally. **/
+async function stockBoost(ns, cities, parts) {
     const ss = ns.corporation.getUpgradeLevel("Smart Storage");
     const space = (division, city, ratio) => warehouseSize(ns.corporation.getWarehouse(division, city).level, ss) * ratio;
     const targets = (division, factors, ratio) => Object.fromEntries(cities.map((city) => [city, optimalBoostMaterials(factors, space(division, city, ratio))]));
-    const agri = targets(AGRI_NAME, agriFactors, cfg.agriRatio);
-    const chem = targets(CHEM_NAME, chemFactors, cfg.chemRatio);
-    const sample = cities[0];
-    corpLog(ns, `${AGRI_NAME}: boost for warehouse space ${space(AGRI_NAME, sample, cfg.agriRatio).toFixed(1)} = ${agri[sample].join("/")} in ${cities.length} cities`);
-    corpLog(ns, `${CHEM_NAME}: boost for warehouse space ${space(CHEM_NAME, sample, cfg.chemRatio).toFixed(1)} = ${chem[sample].join("/")} in ${cities.length} cities`);
-    await stockBoostMaterials(ns, AGRI_NAME, agri);
-    await stockBoostMaterials(ns, CHEM_NAME, chem);
+    for (const [division, factors, ratio] of parts) {
+        const t = targets(division, factors, ratio);
+        corpLog(ns, `${division}: boost for warehouse space ${space(division, cities[0], ratio).toFixed(1)} = ${t[cities[0]].join("/")} in ${cities.length} cities`);
+        await stockBoostMaterials(ns, division, t);
+    }
 }
 
 /** @param {NS} ns @param {ReturnType<typeof argsSchema>} cfg **/
@@ -156,17 +179,45 @@ async function run(ns, cfg) {
     const agriFactors = factorsOf(agriIndustry);
     const chemFactors = factorsOf(chemIndustry);
 
-    // Step 1: Export first (the round's whole point), then Agriculture: Advert 8, office 4 -> 8 all on R&D.
+    // LOW mode's round 2 (`--agri-only` - the guide writer's "Round 2: invest in Agriculture. Take offer."):
+    // the Agriculture investment IS this round. Export, the Chemical division, the export routes and the R&D
+    // switch are all round-3 work below. Nothing here may put the offices on R&D: a round whose only job is to
+    // earn has to keep producing (production is Ops+Eng+Mgmt, §9.1.1) or the funds never arrive.
+    if (cfg.agriOnly) {
+        ensureAdvert(ns, AGRI_NAME, ADVERT_TARGET);
+        for (const city of cities) ensureOfficeSize(ns, AGRI_NAME, city, AGRI_OFFICE_SIZE);
+        buyStoragePlan(ns, cities, agriFactors, cfg);
+        assignProductionJobs(ns, AGRI_NAME, cities, JOBS_AGRI);
+        await stockBoost(ns, cities, [[AGRI_NAME, agriFactors, cfg.agriRatio]]);
+        await waitForOffer(ns, OFFER_INIT_CYCLES, OFFER_EXTRA_CYCLES, cfg.offerExpect);
+        acceptOffer(ns, cfg.offerExpect);
+        return;
+    }
+
+    // Step 1: Export first (the round's whole point), then Agriculture: Advert 8, office 4 -> 8.
     ensureUnlock(ns, "Export");
     ensureAdvert(ns, AGRI_NAME, ADVERT_TARGET);
     for (const city of cities) ensureOfficeSize(ns, AGRI_NAME, city, AGRI_OFFICE_SIZE);
-    setAllOnRnd(ns, AGRI_NAME, cities);
 
     // Step 2: Chemical as the support division - office 3, warehouse 2, all on R&D, no Advert, no office growth.
+    // Unaffordable is a WAIT here, not an error: §19.3 needs 490e9 for this round, and on a BitNode whose
+    // CorporationValuation multiplier shrinks the round-1 offer below the division's fixed price (§17.3: the
+    // offer scales with the multiplier, the 70e9 division + 5 offices/warehouses does not) the round has to
+    // let the corporation earn it. Keeping Agriculture on production jobs while waiting is what makes that
+    // possible - production is Ops/Eng/Mgmt (§9.1.1), so an office left on nothing but R&D earns nothing and
+    // the round would never become affordable (the offer, §17.3, is driven by that same AssetDelta).
     if (!ensureDivision(ns, CHEM_INDUSTRY, CHEM_NAME, cities, CHEM_OFFICE_SIZE, CHEM_WAREHOUSE_LEVEL)) {
-        corpLog(ns, `${CHEM_NAME}: could not be set up - not enough funds?`, "ERROR");
+        assignProductionJobs(ns, AGRI_NAME, cities, JOBS_WHILE_WAITING);
+        corpLog(
+            ns,
+            `${CHEM_NAME}: not affordable yet (${formatMoney(chemIndustry.startingCost)} for the division + 5 offices/warehouses, ${formatMoney(ns.corporation.getCorporation().funds)} in hand) - waiting, ${AGRI_NAME} kept producing`,
+            "WARN",
+        );
         return;
     }
+    // Only now is the research wait worth starting: §19.3.1 wants 700/390 RP, and R&D costs the divisions
+    // their production while it runs, so it must not start before the round can actually proceed.
+    setAllOnRnd(ns, AGRI_NAME, cities);
     setAllOnRnd(ns, CHEM_NAME, cities);
 
     // Step 3: Plants Agriculture -> Chemical and Chemicals Chemical -> Agriculture in every city (§18.2
@@ -186,10 +237,10 @@ async function run(ns, cfg) {
     await waitForResearchPoints(ns, { [AGRI_NAME]: cfg.rpAgri, [CHEM_NAME]: cfg.rpChem });
     ensureAdvert(ns, AGRI_NAME, maxAffordableAdvertLevel(ns.corporation.getHireAdVertCount(AGRI_NAME), ns.corporation.getCorporation().funds));
 
-    assignJobsAllCities(ns, AGRI_NAME, JOBS_AGRI); // step 7: the §19.3.2 job counts
+    assignProductionJobs(ns, AGRI_NAME, cities, JOBS_AGRI); // step 7: the §19.3.2 job counts, fitted to the office
     assignJobsAllCities(ns, CHEM_NAME, JOBS_CHEM);
 
-    await stockBoost(ns, cities, agriFactors, chemFactors, cfg); // step 8
+    await stockBoost(ns, cities, [[AGRI_NAME, agriFactors, cfg.agriRatio], [CHEM_NAME, chemFactors, cfg.chemRatio]]); // step 8
 
     // Step 9: let the offer peak (15 cycles, then up to 10 more while it keeps rising), accept only within
     // 20% of the expected offer. T03 logs the MILESTONE on success and an ERROR on refusal; a refusal leaves
@@ -203,14 +254,19 @@ export async function main(ns) {
     const options = getConfiguration(ns, argsSchema);
     if (!options || (await instanceCount(ns)) > 1) return;
     ns.disableLog("ALL");
+    const offerScale = Number(readBnProfile(ns).offerScale) || 1; // T08: the BitNode's CorporationValuation multiplier
     const cfg = {
-        offerExpect: Number(options["offer-expect"]),
+        agriOnly: !!options["agri-only"],
+        // --offer-expect is an absolute override; the default is the reference's BN3 number scaled by the BitNode.
+        // A LOW-valuation node cannot reach that number at all ("don't aim for a specific number"), so there the
+        // offer is taken at whatever it reaches; see offerMode in corp-lib.
+        offerExpect: offerMode(offerScale) === "LOW" ? 0 : scaledOfferExpect(ROUND2_OFFER_EXPECT, offerScale, options["offer-expect"]),
         agriRatio: Number(options["agri-ratio"]),
         chemRatio: Number(options["chem-ratio"]),
         rpAgri: Number(options["rp-agri"]),
         rpChem: Number(options["rp-chem"]),
     };
-    corpLog(ns, `round 2 starting (agri-ratio=${cfg.agriRatio}, chem-ratio=${cfg.chemRatio}, rp=${cfg.rpAgri}/${cfg.rpChem}, offer-expect=${formatMoney(cfg.offerExpect)})`);
+    corpLog(ns, `round 2 starting (agri-ratio=${cfg.agriRatio}, chem-ratio=${cfg.chemRatio}, rp=${cfg.rpAgri}/${cfg.rpChem}, offer-expect=${formatMoney(cfg.offerExpect)} @ BN valuation x${offerScale})`);
     try {
         await run(ns, cfg);
     } catch (e) {

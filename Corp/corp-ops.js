@@ -289,13 +289,25 @@ export function setBothExports(ns, srcDiv, dstDiv, material, cities) {
     corpLog(ns, `export ${material}: ${srcDiv} -> ${dstDiv} in ${cities.length} cities`);
 }
 
-/** Let the current investment offer grow: initCycles, then up to maxExtraCycles more while it keeps rising.
- * @returns {number} the offer funds left on the table (0 when there is none) **/
+/** Wait for `n` WHOLE corporation cycles. A cycle is the 5 states START..SALE and nextUpdate() resolves once
+ * per STATE, so counting raw nextUpdate() calls is 5x too short: the reference's waitForNumberOfCycles(n)
+ * waits for the same state to RECUR n times. @returns {void} **/
+async function waitForCycles(ns, n) {
+    for (let i = 0; i < n; i++) {
+        const state = ns.corporation.getCorporation().prevState;
+        do {
+            await ns.corporation.nextUpdate();
+        } while (ns.corporation.getCorporation().prevState !== state);
+    }
+}
+
+/** Let the current investment offer grow: initCycles whole cycles, then up to maxExtraCycles more while it keeps
+ * rising. @returns {number} the offer funds left on the table (0 when there is none) **/
 export async function waitForOffer(ns, initCycles, maxExtraCycles, expectedFunds) {
-    for (let i = 0; i < initCycles; i++) await ns.corporation.nextUpdate();
+    await waitForCycles(ns, initCycles);
     let offer = ns.corporation.getInvestmentOffer().funds;
     for (let i = 0; i < maxExtraCycles; i++) {
-        await ns.corporation.nextUpdate();
+        await waitForCycles(ns, 1);
         const now = ns.corporation.getInvestmentOffer().funds;
         if (i % 2 === 0) corpLog(ns, `offer ${money(now)}`);
         if (now < offer * 1.001) break; // it stopped growing - take what is on the table

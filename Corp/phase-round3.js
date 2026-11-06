@@ -38,12 +38,15 @@
  * 150e9/30e9, buyBoostMaterials).
  */
 import { formatMoney, getConfiguration, instanceCount } from "../helpers.js";
-import { AGRI_NAME, BN_FILE, CHEM_NAME, TOB_NAME, corpLog, getCities, runWorker } from "./corp-lib.js";
+import { AGRI_NAME, CHEM_NAME, TOB_NAME, corpLog, getCities, readBnProfile, runWorker } from "./corp-lib.js";
 import { allowedProductCeiling, nextProductName, ratiosToCounts } from "./corp-formulas.js";
 import { assignJobs, ensureDivision, ensureUnlock, setBothExports } from "./corp-ops.js";
 
 const TOB_INDUSTRY = "Tobacco";
-const TOB_ROUND = 3; // the offer round this setup belongs to (T02 allowedProductCeiling: round 3 -> 1 product)
+// This job runs in round 3 on a BN3-scale node, but in round 4 on a LOW-offer one (Tobacco moves a round
+// later - see Corp/corp-rules.js detectPhase - and its --round reaches T18/T19's office ratios), so the round
+// is read from the live offer at run time. Same convention as corp-offers/corp-products/corp-offices:
+// funds 0 means "no offer left / public" => 5.
 const TOB_OFFICE_SIZE = 3; // reference createDivision(Tobacco, 3, 1): a new division's office is 3
 const TOB_WAREHOUSE_LEVEL = 1;
 const EXPORT_MATERIAL = "Plants"; // Agriculture's product, needed by Tobacco and by Chemical (§4.3 p22)
@@ -70,11 +73,13 @@ export function autocomplete(data, _) {
 
 /** T08's division cap (/Temp/corp-bn.txt). A missing or unreadable file means BN3's 20. **/
 function maxDivisions(ns) {
-    try {
-        return JSON.parse(ns.read(BN_FILE))?.maxDivisionsApprox ?? DEFAULT_MAX_DIVISIONS;
-    } catch {
-        return DEFAULT_MAX_DIVISIONS;
-    }
+    return readBnProfile(ns).maxDivisionsApprox ?? DEFAULT_MAX_DIVISIONS;
+}
+
+/** The offer round this setup is running in: funds 0 means "no offer left / public" => 5. **/
+function offerRound(ns) {
+    const offer = ns.corporation.getInvestmentOffer();
+    return offer.funds === 0 ? 5 : offer.round;
 }
 
 /** Put every employee of a division on R&D (support offices until the first product completes, §4.3).
@@ -116,7 +121,7 @@ function setMainOfficeJobs(ns, city) {
  * materials last, after it has changed the warehouse sizes). One budget per division, spent in this order:
  * product division first, then the two support divisions with their §19.4.2 start-of-round-3 shares.
  * Without T18 nothing is spent - the daemon's improve rule does it on a later cycle. **/
-async function spend(ns, cfg) {
+async function spend(ns, cfg, round) {
     if (!ns.fileExists(IMPROVE_SCRIPT)) {
         corpLog(ns, `nothing spent: ${IMPROVE_SCRIPT} is not installed (T18) - skipping the ${TOB_NAME}/${AGRI_NAME}/${CHEM_NAME} office, warehouse and upgrade plan this run`, "WARN");
         return;
@@ -124,26 +129,34 @@ async function spend(ns, cfg) {
     const improveArgs = (division, budget, support) => [
         "--division", division,
         "--budget", String(Math.floor(budget)),
-        "--round", String(TOB_ROUND),
+        "--round", String(round),
         "--mat-ratio", String(cfg.matRatio),
         "--product-city", cfg.productCity,
         ...(support ? ["--support"] : []),
     ];
     // §19.4.2: >=90% of the funds to the product division, keeping the support reserve and the first product.
+    // Those 150e9/30e9 reserves are BN3 numbers, and on a LOW-offer node this job runs a round later with a
+    // fraction of the money - there they would hand the whole treasury to Agriculture. Keep their 5:1 ratio and
+    // scale them to this round's funds: at BN3 scale (funds >= 600e9) the factor is 1 and nothing changes.
     const funds = ns.corporation.getCorporation().funds;
-    const total = funds - cfg.agriBudget - cfg.chemBudget - cfg.firstProductBudget;
+    const scale = Math.min(1, (funds * 0.3) / (cfg.agriBudget + cfg.chemBudget));
+    const agri = cfg.agriBudget * scale;
+    const chem = cfg.chemBudget * scale;
+    const total = funds - agri - chem - cfg.firstProductBudget;
     if (total <= 0) corpLog(ns, `no product-division budget: ${formatMoney(funds)} left after the support reserve and the product`, "WARN");
     else await runWorker(ns, IMPROVE_SCRIPT, improveArgs(TOB_NAME, total * 0.99, false));
-    await runWorker(ns, IMPROVE_SCRIPT, improveArgs(AGRI_NAME, cfg.agriBudget, true));
-    await runWorker(ns, IMPROVE_SCRIPT, improveArgs(CHEM_NAME, cfg.chemBudget, true));
+    await runWorker(ns, IMPROVE_SCRIPT, improveArgs(AGRI_NAME, agri, true));
+    await runWorker(ns, IMPROVE_SCRIPT, improveArgs(CHEM_NAME, chem, true));
 }
 
 /** Step 8: the first product of round 3 (the reference's developNewProduct(..., 1e9)). Returns its name,
  * or null when nothing was created. Round 3 allows exactly one product (T02 allowedProductCeiling), so a
  * relaunch after a crash finds it here and does not spend the 1e9 twice. **/
-function developFirstProduct(ns, cfg) {
+function developFirstProduct(ns, cfg, round) {
     const division = ns.corporation.getDivision(TOB_NAME);
-    const ceiling = Math.min(allowedProductCeiling(TOB_ROUND), division.maxProducts);
+    // Exactly one product: this job owns the FIRST product and T13 develops further ones once the offers are
+    // gone, so a crash-relaunch must not spend the 1e9 again just because a later round allows more.
+    const ceiling = Math.min(allowedProductCeiling(round), division.maxProducts, 1);
     if (division.products.length >= ceiling) {
         corpLog(ns, `${TOB_NAME}: ${division.products.length} product(s) already in development (ceiling ${ceiling}) - not creating another`);
         return division.products[0] ?? null;
@@ -202,9 +215,11 @@ async function run(ns, cfg) {
     }
     setMainOfficeJobs(ns, cfg.productCity);
 
-    await spend(ns, cfg); // step 7
+    const round = offerRound(ns); // 3 on a BN3-scale node, 4 on a LOW-offer one - T18/T19 buy per-round ratios
 
-    const product = developFirstProduct(ns, cfg); // step 8
+    await spend(ns, cfg, round); // step 7
+
+    const product = developFirstProduct(ns, cfg, round); // step 8
 
     // Step 9: the product/pricing/offer services are started by the daemon (T12-T14).
     corpLog(ns, product === null ? `${TOB_NAME} created, no product in development yet` : `${TOB_NAME} created, first product ${product} in development`, "MILESTONE");
