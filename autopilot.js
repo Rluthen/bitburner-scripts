@@ -40,6 +40,20 @@ export function autocomplete(data, args) {
 
 export const CORPORATION_SELF_FUND_COST = 150e9; // stable helpers.ts costOfCreatingCorporation(false); mirrors Corp/phase-round1.js
 
+/** Home RAM (GB) autopilot tells daemon.js to keep out of its hack/grow/weaken batches while the
+ *  corporation runs. daemon.js's own default (--reserved-ram 32, doubled to 64 once home >=
+ *  --double-reserve-threshold 512 GB) is smaller than the corporation suite needs, so the scheduler
+ *  fills home and corp.js loses the ns.run race for its own snapshot:
+ *  "not enough home RAM for Corp/corp-snapshot.js: needs 103.00 GB, free 32.00 GB".
+ *  Sizing (docs figures, T21 RAM audit - re-derive with `mem` before trusting): services + the per-cycle
+ *  snapshot (103.0) + the largest job (phase-round1 554.3) = 1132.6 GB, or 1306.8 GB with --custom-supply;
+ *  +~90 GB slack for the game's own home residents (stats.js, sleeves, gangs, ...).
+ *  On a home smaller than this, daemon.js's `maxRam - reserved` clamps to 0 and home stops batching
+ *  entirely - the accepted trade while the corporation is running.
+ *  ponytail: one constant, no per-BN sizing. Set it to 1e100 to take home out of batching outright (the
+ *  stanek value in reservedHomeRam), or to 0 to leave daemon.js's own default alone. */
+export const CORP_HOME_RESERVE = 1400;
+
 /** Pure: what should autopilot do about the corporation on this check?
  *  `liquidate` = sell the portfolio now, `launch` = start corp.js now, `unavailable` = this BN cannot create one.
  *  @param {{corpRunning: boolean, hasCorp: boolean, funding: boolean, canSeed: boolean, canSelfFund: boolean, cash: number, stocks: number}} s */
@@ -52,6 +66,26 @@ export function corporationPlan({ corpRunning, hasCorp, funding, canSeed, canSel
     // shortfall cannot become sell -> re-buy -> sell churn.
     if (!funding && cash + stocks >= CORPORATION_SELF_FUND_COST) return { liquidate: true, launch: false, unavailable: false };
     return { liquidate: false, launch: false, unavailable: false }; // still saving
+}
+
+/** Pure: how much home RAM (GB) daemon.js must keep free from its hack/grow/weaken batches.
+ *  0 = pass no --reserved-ram at all, leaving daemon.js's own default (32 GB, doubled at 512 GB home) alone.
+ *  @param {{stanekRunning: boolean, sf4: number, corpRunning: boolean}} s @returns {number} **/
+export function reservedHomeRam({ stanekRunning, sf4, corpRunning }) {
+    if (stanekRunning) return 1e100; // stanek.js has the whole home; nothing may batch on it (pre-existing rule)
+    const sf4Reserve = sf4 && sf4 < 3 ? 32 * (sf4 == 2 ? 4 : 16) : 0; // pre-existing SF4 < 3 rule, unchanged
+    return Math.max(sf4Reserve, corpRunning ? CORP_HOME_RESERVE : 0);
+}
+
+/** Pure: does the live daemon.js need a restart to pick up `reservedRam`? daemon.js's own relaunch
+ *  heuristic ignores NUMERIC args, so a changed --reserved-ram would otherwise never take effect.
+ *  @param {string[]|undefined} runningArgs the live daemon.js's args (undefined = it is not running)
+ *  @param {number} reservedRam the value we want it to run with @returns {boolean} **/
+export function daemonRamReserveChanged(runningArgs, reservedRam) {
+    if (!runningArgs) return false; // not running: the `!existingDaemon` path starts it with the new args
+    const i = runningArgs.indexOf("--reserved-ram");
+    const running = i >= 0 ? Number(runningArgs[i + 1]) : 32; // absent = daemon.js's schema default
+    return running !== reservedRam;
 }
 
 /** Offline check for the pure decision above: node --input-type=module -e "import('./autopilot.js').then(m => m.selfCheck())" */
@@ -72,7 +106,25 @@ export function selfCheck() {
     eq(corporationPlan({ ...base, canSeed: true, cash: 0, stocks: 0 }), { liquidate: false, launch: true, unavailable: false }, "BN3 seed needs no money");
     eq(corporationPlan({ ...base, hasCorp: true, cash: 0, stocks: 0 }), { liquidate: false, launch: true, unavailable: false }, "restart a dead manager");
     eq(corporationPlan({ ...base, corpRunning: true, cash: 150e9 }), none, "manager already running");
+    // maybeStartCorporation only treats `launch:false` as "still saving for the seed" when !hasCorp, so a corporation
+    // that exists with its manager running must stay a plain no-op plan (it used to print the saving status line).
+    eq(corporationPlan({ ...base, corpRunning: true, hasCorp: true, cash: 3.21e9, stocks: 6.882e9 }), none, "managed corporation: nothing to do, never 'saving'");
     eq(corporationPlan({ ...base, canSelfFund: false }), { liquidate: false, launch: false, unavailable: true }, "this BN cannot create one");
+    // reservedHomeRam: the corporation outranks an early SF4's reserve; stanek owns all of home.
+    eq(reservedHomeRam({ stanekRunning: false, sf4: undefined, corpRunning: true }), CORP_HOME_RESERVE, "reservedHomeRam: corporation needs home RAM");
+    eq(reservedHomeRam({ stanekRunning: false, sf4: 1, corpRunning: false }), 512, "reservedHomeRam: SF4 level 1 (pre-existing rule)");
+    eq(reservedHomeRam({ stanekRunning: false, sf4: 2, corpRunning: false }), 128, "reservedHomeRam: SF4 level 2 (pre-existing rule)");
+    eq(reservedHomeRam({ stanekRunning: false, sf4: 3, corpRunning: false }), 0, "reservedHomeRam: SF4 level 3 reserves nothing");
+    eq(reservedHomeRam({ stanekRunning: false, sf4: undefined, corpRunning: false }), 0, "reservedHomeRam: nothing needs home");
+    eq(reservedHomeRam({ stanekRunning: false, sf4: 2, corpRunning: true }), CORP_HOME_RESERVE, "reservedHomeRam: corporation outranks SF4 level 2");
+    eq(reservedHomeRam({ stanekRunning: true, sf4: 2, corpRunning: true }), 1e100, "reservedHomeRam: stanek wins outright");
+    // daemonRamReserveChanged: a changed reserve must force the relaunch daemon.js's own heuristic skips.
+    eq(daemonRamReserveChanged(undefined, CORP_HOME_RESERVE), false, "reserve: daemon.js not running");
+    eq(daemonRamReserveChanged([], CORP_HOME_RESERVE), true, "reserve: running with daemon.js's schema default (32)");
+    eq(daemonRamReserveChanged(["--reserved-ram", 32], CORP_HOME_RESERVE), true, "reserve: running with 32");
+    eq(daemonRamReserveChanged(["--reserved-ram", CORP_HOME_RESERVE], CORP_HOME_RESERVE), false, "reserve: already correct - must not relaunch every check");
+    eq(daemonRamReserveChanged(["--reserved-ram", 1e100], CORP_HOME_RESERVE), true, "reserve: stanek ended - hand RAM back");
+    eq(daemonRamReserveChanged(["--cycle-timing-delay", 40, "--silent-misfires"], CORP_HOME_RESERVE), true, "reserve: a flag list is not a reserve");
     return true;
 }
 
@@ -553,10 +605,15 @@ export async function main(ns) {
             return false;
         }
         const hasCorp = ns.corporation.hasCorporation(); // 0 GB
-        const canSeed = ns.corporation.canCreateCorporation(false) === 'Success'; // 0 GB
-        const canSelfFund = ns.corporation.canCreateCorporation(true) === 'Success'; // 0 GB
+        const corpRunning = !!findScript('corp.js');
+        // Only ask canCreateCorporation while there is no corporation. Once one exists it returns "CorporationExists"
+        // AND the game itself logs that into this script's tail (stable src/NetscriptFunctions/Corporation.ts:621, via
+        // helpers.log), so the two calls below printed a line every single check. corporationPlan() restarts a dead
+        // manager before it ever reads these, so "false" is the correct input once hasCorp.
+        const canSeed = !hasCorp && ns.corporation.canCreateCorporation(false) === 'Success'; // 0 GB
+        const canSelfFund = !hasCorp && ns.corporation.canCreateCorporation(true) === 'Success'; // 0 GB
         const plan = corporationPlan({
-            corpRunning: !!findScript('corp.js'), hasCorp, funding: fundingCorporation,
+            corpRunning, hasCorp, funding: fundingCorporation,
             canSeed, canSelfFund, cash: player.money, stocks: stocksValue,
         });
         if (plan.unavailable) {
@@ -573,7 +630,9 @@ export async function main(ns) {
             return true;
         }
         if (!plan.launch) {
-            if (!fundingCorporation) // While funding, the status line above already explains the wait
+            // With a corporation up and its manager running the plan is also "do nothing", but that is not a
+            // waiting-for-the-seed state - saying so every check just buried the real status line.
+            if (!fundingCorporation && !hasCorp) // While funding, the status line above already explains the wait
                 setStatus(ns, `Saving for a corporation: ${formatMoney(player.money)} cash + ${formatMoney(stocksValue)} stocks of ${formatMoney(CORPORATION_SELF_FUND_COST)}.`);
             return false;
         }
@@ -743,9 +802,6 @@ export async function main(ns) {
             if (options['disable-bladeburner']) daemonArgs.push('--disable-script', getFilePath('bladeburner.js'));
             // Relay the option to suppress tail windows
             if (options['no-tail-windows']) daemonArgs.push('--no-tail-windows');
-            // If we have SF4, but not level 3, instruct daemon.js to reserve additional home RAM
-            if ((4 in unlockedSFs) && unlockedSFs[4] < 3)
-                daemonArgs.push('--reserved-ram', 32 * ((unlockedSFs[4] ?? 0) == 2 ? 4 : 16));
         }
 
         // Once stanek's gift is accepted, launch it once per reset before we launch daemon (Note: stanek's gift is auto-purchased by faction-manager.js on your first install)
@@ -758,13 +814,19 @@ export async function main(ns) {
             launchScriptHelper(ns, 'stanek.js', stanekArgs);
             stanekRunning = true;
         }
-        // If stanek is running, tell daemon to reserve all home RAM for it.
-        if (stanekRunning)
-            daemonArgs.push("--reserved-ram", 1E100);
+        // Reserve home RAM for whatever outranks hacking batches: stanek's gift (all of home), an early
+        // SF4, or the running corporation (see CORP_HOME_RESERVE). Exactly one --reserved-ram, because
+        // ns.flags is non-permissive and a duplicated flag has no defined winner.
+        const reservedRam = reservedHomeRam({
+            stanekRunning, sf4: unlockedSFs[4], corpRunning: !!findScript('corp.js') || ns.corporation.hasCorporation(),
+        });
+        if (reservedRam > 0) daemonArgs.push("--reserved-ram", reservedRam);
 
         // Launch (or re-launch) daemon if it is not already running with all our desired args.
         // Hack: Ignore numeric arguments in the comparison, since we e.g. tweak --recovery-thread-padding over time
-        let launchDaemon = !existingDaemon || daemonArgs.some(arg => !existingDaemon.args.includes(arg) && !Number.isFinite(arg)) ||
+        // - which is exactly why a CHANGED --reserved-ram needs its own explicit check (daemonRamReserveChanged).
+        let launchDaemon = !existingDaemon || daemonRamReserveChanged(existingDaemon?.args, reservedRam) ||
+            daemonArgs.some(arg => !existingDaemon.args.includes(arg) && !Number.isFinite(arg)) ||
             // Special cases: We also must relaunch daemon if it is running with certain flags we wish to remove
             (["--xp-only"].some(arg => !daemonArgs.includes(arg) && existingDaemon.args.includes(arg)))
         if (launchDaemon) {
