@@ -352,7 +352,10 @@ async function waitForOffer(ns, initCycles, maxExtraCycles, expectedFunds) {
 function acceptOffer(ns, offerRound, expectedFunds, minFraction) {
     const offered = ns.corporation.getInvestmentOffer().funds;
     if (offered < minFraction * expectedFunds) {
-        corpLog(ns, `refused round ${offerRound} offer ${formatMoney(offered)}: under ${Math.round(minFraction * 100)}% of the expected ${formatMoney(expectedFunds)}`, "ERROR");
+        // INFO, not ERROR: this is the normal waiting condition of a round whose offer has not grown yet, and
+        // waitForOffer() has just WARNed the same numbers - the daemon tprints (red, in the terminal) every
+        // ERROR, which turned a recurring "still too low" into an alert.
+        corpLog(ns, `refused round ${offerRound} offer ${formatMoney(offered)}: under ${Math.round(minFraction * 100)}% of the expected ${formatMoney(expectedFunds)}`);
         return false;
     }
     let accepted = false;
@@ -616,6 +619,9 @@ export async function selfCheck() {
     r = await run(fakeState({ offerFunds: 1e15, products: [done(0)] }));
     must(r.ns.calls.accept === 0, "an offer under 80% is refused");
     must(r.ns.lines.some((l) => l.includes("refused round 3 offer")), `refusal is logged: ${r.ns.lines}`);
+    // A below-floor offer is a normal waiting condition, and the wait above already WARNed that the offer is
+    // under the expected one - the refusal must not also be an ERROR (the daemon tprints every ERROR).
+    must(!r.ns.lines.some((l) => l.includes("refused round 3 offer") && l.includes("|ERROR|")), `refusal is not an ERROR: ${r.ns.lines}`);
 
     // Round 5 (offer 4 taken / public): go public with 0 new shares, set the dividend once, never sell shares.
     // One state object for both runs: goPublic makes it public for the second one.
