@@ -244,6 +244,12 @@ export async function main(ns) {
             total_aug_cost: getTotalCost(purchaseableAugs), // Total money needed to buy all affordable augs (excludes the rep cost above)
             // Unpurchased augs
             unpurchased_count: Object.values(augmentationData).filter(a => !a.owned).length, // Number of augs are we have not yet purchased (note: depending on config, may not include all augs in the game)
+            // Rep still needed per faction for the augs we still want - consumed by Corp/corp-offers.js to pick
+            // faction-bribe targets on a BitNode whose dividend transfer is crushed (do NOT rename: it is a contract)
+            rep_needed_by_faction: repNeededByFaction(
+                Object.values(augmentationData).filter(a => !a.owned && a.name != strNF && !omitAugs.includes(a.name)),
+                factionData,
+            ),
         }, undefined, 2), "w");
     }
 }
@@ -557,6 +563,27 @@ let augSortOrder = (a, b) =>
     (a.name == strNF && b.name == strNF ? a.price - b.price : 0) ||
     (b.price - a.price) || (b.reputation - a.reputation) ||
     (b.desired != a.desired ? (a.desired ? -1 : 1) : a.name.localeCompare(b.name));
+
+/** Reputation still needed, per faction, to buy the augmentations we still want from it - the goal a
+ * corporation's faction bribes fill (Corp/corp-offers.js reads the `rep_needed_by_faction` key of this run's
+ * output file). One entry per faction holding its LARGEST remaining deficit; a faction whose reputation already
+ * covers everything it offers drops out, so a briber spending against this map stops on its own. NeuroFlux is
+ * excluded: it is available everywhere and its rep cost moves with every install.
+ * `augs` are AugmentationData-alikes; only `.name`, `.reputation` and `.getFromJoined()` are read. Pure.
+ * @param {{name:string, reputation:number, getFromJoined:()=>string|undefined}[]} augs the unowned augs we want
+ * @param {{[factionName:string]: {reputation:number}}} factions
+ * @returns {{[factionName:string]: number}} **/
+function repNeededByFaction(augs, factions) {
+    const need = {};
+    for (const aug of augs) {
+        if (aug.name == strNF) continue;
+        const faction = aug.getFromJoined();
+        if (!faction) continue; // no joined faction offers it yet (getFromJoined() returns undefined)
+        const deficit = aug.reputation - (factions[faction]?.reputation ?? 0);
+        if (deficit > 0) need[faction] = Math.max(need[faction] ?? 0, deficit);
+    }
+    return need;
+}
 
 /** Sort augmentations such that they are in order of price, except when there are prerequisites to worry about
  * @param {NS} ns
@@ -1006,4 +1033,24 @@ function displayFactionSummary(ns, sortBy, unique, overrideFinishedFactions, exc
         summaryFactions = actualUnjoinedFactions;
     }
     log(ns, `INFO: The following is a summary of ${unownedAugCount} remaining augmentations available from each faction:\n` + summary, printToTerminal);
+}
+
+/** Offline check of the pure helpers (no game, no ns):
+ *   node --input-type=module -e "import('./faction-manager.js').then(m=>m.selfCheck()).then(()=>console.log('faction-manager ok'))"
+ * Proves the arithmetic only - NOT in-game correctness. **/
+export function selfCheck() {
+    const must = (ok, label) => {
+        if (!ok) throw new Error(`faction-manager selfCheck: ${label}`);
+    };
+    const aug = (name, reputation, from) => ({ name, reputation, getFromJoined: () => from }); // duck-typed: the helper reads only these
+    const factions = { CyberSec: { reputation: 1e3 }, NiteSec: { reputation: 5e4 } };
+    const need = repNeededByFaction([aug("A", 2e5, "CyberSec"), aug("B", 1e5, "NiteSec"), aug("C", 5e4, "NiteSec")], factions);
+    must(need.CyberSec === 199000, `CyberSec deficit: ${need.CyberSec}`);
+    must(need.NiteSec === 50000, `NiteSec keeps the largest deficit: ${need.NiteSec}`);
+    must(Object.keys(need).length === 2, `one entry per faction: ${Object.keys(need).length}`);
+    must(Object.keys(repNeededByFaction([aug("D", 1e5, "Sector-12")], { "Sector-12": { reputation: 1e5 } })).length === 0, "a faction we can already buy from is not a goal");
+    must(Object.keys(repNeededByFaction([aug("E", 1e6, undefined)], factions)).length === 0, "an aug no joined faction has is not a goal");
+    must(Object.keys(repNeededByFaction([aug(strNF, 1e9, "CyberSec")], factions)).length === 0, "NeuroFlux is never a faction goal");
+    must(repNeededByFaction([aug("F", 1e5, "Nowhere")], {}).Nowhere === 1e5, "an unknown faction counts as 0 rep");
+    return true;
 }

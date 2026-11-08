@@ -14,14 +14,15 @@
  * of the service and the product is never re-measured while it runs (a restart just costs one cycle each).
  *
  * State comes from the T04 snapshot (ns.read, 0 GB): division list, awareness/popularity, makesProducts,
- * researched, cities and the cities that HAVE a warehouse (getMaterial throws without one). Only the
- * per-city numbers are read live.
+ * researched, cities and the cities that HAVE a warehouse (getMaterial throws without one). The per-city numbers
+ * and the products' EXISTENCE are read live - a product name in the file can already be gone from the game (a
+ * replacement), and getProduct/sellProduct on it THROW.
  *
  * Distinct ns.corporation.* APIs referenced by THIS file (docs figures, NOT measured):
  *   0 GB : hasCorporation nextUpdate
- *   10 GB: getIndustryData getMaterial getMaterialData getOffice getProduct
+ *   10 GB: getDivision getIndustryData getMaterial getMaterialData getOffice getProduct
  *   20 GB: sellMaterial sellProduct setMaterialMarketTA2 setProductMarketTA2
- *   => docs sum 130 GB + script base. Imports corp-lib.js / corp-formulas.js (0 corporation APIs) and
+ *   => docs sum 140 GB + script base. Imports corp-lib.js / corp-formulas.js (0 corporation APIs) and
  *      helpers.js (getConfiguration). Deliberately does NOT import Corp/corp-ops.js (importing
  *      it would charge this service the ~30-function union of that shared module).
  *
@@ -105,8 +106,16 @@ export function runCycle(ns, snapshot, mem) {
         // producedMaterials belong to material industries too (Agriculture, Chemical), not just product ones (step 4).
         const industry = ns.corporation.getIndustryData(d.industry);
         const materials = industry.producedMaterials ?? [];
-        const finished =
+        const snapshotFinished =
             d.makesProducts === true ? (d.products ?? []).filter((p) => p.developmentProgress >= 100).map((p) => p.name) : [];
+        // The snapshot is a FILE, so a name in it can already be gone from the game (in-game 2026-11-08): corp-products
+        // frees a slot by discontinuing a product and creating its replacement in the SAME cycle, and this service only
+        // ever sees the next snapshot. getProduct/sellProduct/setProductMarketTA2 on such a name THROW "Invalid product
+        // name" and kill the service, so price only the names the live division still has.
+        const liveNames = new Set(snapshotFinished.length === 0 ? [] : ns.corporation.getDivision(division).products);
+        const finished = snapshotFinished.filter((name) => liveNames.has(name));
+        if (finished.length < snapshotFinished.length)
+            warnOnce(ns, mem, `stale:${division}`, `${division}: ${snapshotFinished.length - finished.length} snapshot product(s) no longer exist (replaced) - not pricing them`);
         const warehouseCities = Object.keys(d.warehouses ?? {}); // getMaterial THROWS in a city with no warehouse
 
         // 1. Baseline - always, unlocks or not: a finished product must at least be on sale at market price.
@@ -268,27 +277,33 @@ export function readSnapshot(text) {
 // Offline self-check (fabricated snapshot + mock ns - proves the wiring, NOT in-game correctness).
 
 /** Minimal fake NS for the check below: only the APIs this file touches. `state.sold` is the sale the game
- * would have recorded for the measurement cycle. **/
+ * would have recorded for the measurement cycle, `state.live` the product names the game still HAS - getProduct
+ * throws the game's own "Invalid product name" for anything else (a snapshot can list a replaced product). **/
 function mockNs(state) {
     const calls = { sellProduct: [], sellMaterial: [], productTA2: [], materialTA2: [] };
+    const live = state.live ?? ["P1"];
     return {
         calls,
         print: () => {},
         getScriptName: () => "Corp/corp-pricing.js",
         getPortHandle: () => ({ write: () => {} }),
         corporation: {
+            getDivision: () => ({ products: live }),
             getIndustryData: () => ({ advertisingFactor: 0.05, producedMaterials: ["Plants"], makesProducts: true }),
             getOffice: () => ({ employeeProductionByJob: { Business: 10 } }),
-            getProduct: (_d, _c, name) => ({
-                name,
-                developmentProgress: 100,
-                effectiveRating: 100,
-                productionCost: 1000,
-                stored: 10,
-                actualSellAmount: state.sold,
-                demand: 100,
-                competition: 0,
-            }),
+            getProduct: (_d, _c, name) => {
+                if (!live.includes(name)) throw new Error(`Invalid product name: '${name}'`);
+                return {
+                    name,
+                    developmentProgress: 100,
+                    effectiveRating: 100,
+                    productionCost: 1000,
+                    stored: 10,
+                    actualSellAmount: state.sold,
+                    demand: 100,
+                    competition: 0,
+                };
+            },
             getMaterial: () => ({ quality: 1, marketPrice: 10, stored: 10, demand: 100, competition: 0 }),
             getMaterialData: () => ({ baseMarkup: 0.05 }),
             sellProduct: (division, city, name, amt, price, all) => calls.sellProduct.push({ division, city, name, amt, price, all }),
@@ -395,6 +410,14 @@ export function selfCheck() {
     });
     runCycle(nsNan, fakeSnapshot(), newMemory());
     must(nsNan.calls.sellProduct.filter((c) => c.all === false).length === 0, "Infinity productionCost -> no sell order");
+
+    // A product the snapshot still lists but the game no longer has (corp-products discontinues the worst product at
+    // the division's cap and creates its replacement in the same cycle, so the file can name a gone product) must
+    // never be priced: getProduct THROWs "Invalid product name" and the daemon's service dies with it.
+    const nsGone = mockNs({ sold: 4, live: [] });
+    const c6 = runCycle(nsGone, fakeSnapshot(), newMemory());
+    must(nsGone.calls.sellProduct.length === 0, `a replaced product is never sold: ${JSON.stringify(nsGone.calls.sellProduct)}`);
+    must(c6.baseline === 0 && c6.custom === 2, `only the live materials are priced: ${JSON.stringify(c6)}`); // 2 cities x 1 material
 
     // A division without a warehouse in a city must not call getMaterial there (it throws).
     const nsNoWh = mockNs({ sold: 4 });

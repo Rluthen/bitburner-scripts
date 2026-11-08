@@ -98,7 +98,7 @@ async function runDaemon(ns) {
         lastJobCycle: {}, // per-script launch cycle (T06 cadence)
         lastStatusMs: 0, // wall clock of the last healthcheck line printed to the tail (statusDue throttle)
         job: null, // the one job we started: { script, pid }
-        launchHistory: [], // { script, cycle, phase } - for the looping-job guard
+        launchHistory: [], // { key, script, cycle, phase } - key = work unit (script + division) for the looping-job guard
         halted: false, // set when a job loops; user must restart the daemon
         bnViable: true, // false => observe-only (no jobs)
         runningJob: false,
@@ -226,8 +226,19 @@ async function reconcileServices(ns, ctx, services) {
     }
 }
 
+/** What the loop guard counts: the job AND the division it works on. Counting by SCRIPT alone read the GROW
+ * cadence - Corp/corp-improve.js launched for a different division every few cycles, plus the chem/agri
+ * support jobs on their own `ctx.cycle % N` clocks - as a loop, and halted every future launch (in-game
+ * 18:19:15: "job Corp/corp-improve.js is looping - pausing launches until restart"). Per division the
+ * >= PHASE_RELAUNCH spacing keeps any work unit below the 3-in-15-cycles threshold. **/
+function jobKey(job) {
+    const i = job.args.indexOf("--division");
+    return i < 0 ? job.script : `${job.script} ${job.args[i + 1]}`;
+}
+
 /** Launch at most ONE job: none while one runs, none while paused/dry/observe-only, and none at all
- * after the same job has relaunched 3+ times in 15 cycles without the phase moving on (halted). **/
+ * after the SAME work unit (script + division) has relaunched 3+ times in 15 cycles without the phase
+ * moving on (halted). **/
 async function maybeLaunchJob(ns, ctx, plan) {
     if (!ctx.bnViable || ctx.halted || !plan.job) return;
     const job = plan.job;
@@ -235,7 +246,8 @@ async function maybeLaunchJob(ns, ctx, plan) {
         announce(ns, ctx, `${ctx.paused ? "PAUSED" : "DRYRUN"} would start`, job.script, job.args);
         return;
     }
-    const recent = ctx.launchHistory.filter((h) => h.script === job.script && h.cycle > ctx.cycle - 15);
+    const key = jobKey(job);
+    const recent = ctx.launchHistory.filter((h) => h.key === key && h.cycle > ctx.cycle - 15);
     if (recent.length >= 3 && recent.every((h) => h.phase === plan.phase)) {
         ctx.halted = true;
         logLine(ns, ctx, "ERROR", `job ${job.script} is looping - pausing launches until restart`);
@@ -246,7 +258,7 @@ async function maybeLaunchJob(ns, ctx, plan) {
     if (!res.ok) return; // launch already warned (missing script / not enough RAM)
     ctx.job = { script: job.script, pid: res.pid };
     ctx.lastJobCycle[job.script] = ctx.cycle;
-    ctx.launchHistory.push({ script: job.script, cycle: ctx.cycle, phase: plan.phase });
+    ctx.launchHistory.push({ key, script: job.script, cycle: ctx.cycle, phase: plan.phase });
     logLine(ns, ctx, "INFO", `started ${job.script}${job.args.length ? " " + job.args.join(" ") : ""} - ${job.reason}`);
 }
 
@@ -469,7 +481,7 @@ function banner(ns, ctx) {
 /** Offline check of the warn-once / announce dedupe (no game - corp.js has no top-level ns use):
  *   node --input-type=module -e "import('./corp.js').then(m=>m.selfCheck()).then(()=>console.log('corp.js selfCheck ok'))"
  * Proves repeated warnings collapse to one line - NOT in-game correctness. **/
-export function selfCheck() {
+export async function selfCheck() {
     const lines = [];
     const ns = { print: (t) => lines.push(String(t)), write: () => {}, tprint: () => {}, toast: () => {} };
     const ctx = { cycle: 1, phase: "R1", warned: new Set(), announced: new Set() };
@@ -507,5 +519,29 @@ export function selfCheck() {
     opts2.verbose = true;
     statusLine(ns2, ctx2, st2, plan2);
     if (tail.length !== 2 || logLines.length !== 3) throw new Error(`statusLine --verbose: tail=${tail.length} log=${logLines.length}, want 2/3`);
+    // The looping-job guard must count WORK UNITS, not script names. In-game (18:19:15, c15) it halted the whole
+    // daemon on normal work: the GROW cadence launches Corp/corp-improve.js for a different division every few
+    // cycles - advert is due at c1 and every 5 cycles after, so improve slips in at c2/c7/c12, then the chem
+    // support job (`ctx.cycle % 15`) launches a fourth at c15. Three corp-improve launches inside the guard's
+    // (cycle-15, cycle) window read as a loop and killed every future launch.
+    const gctx = {
+        cycle: 0, phase: "GROW", warned: new Set(), announced: new Set(), launchHistory: [], lastJobCycle: {},
+        job: null, dryRun: false, paused: false, bnViable: true, halted: false,
+    };
+    const gns = {
+        fileExists: () => true, getScriptRam: () => 1, getServerMaxRam: () => 1e6, getServerUsedRam: () => 0,
+        run: () => 1, print: () => {}, write: () => {}, tprint: () => {}, toast: () => {}, getScriptName: () => "corp.js",
+    };
+    const growPlan = (division) => ({
+        phase: "GROW",
+        job: { script: "Corp/corp-improve.js", args: ["--division", division, "--budget", "1"], reason: "improve" },
+        services: [],
+        notes: [],
+    });
+    for (const [cycle, division] of [[2, "Ebon Stick"], [7, "Ebon Stick"], [12, "Ebon Stick"], [15, "Black Salt"]]) {
+        gctx.cycle = cycle;
+        await maybeLaunchJob(gns, gctx, growPlan(division));
+    }
+    if (gctx.halted) throw new Error("three corp-improve launches for two divisions must not halt the daemon");
     return true;
 }

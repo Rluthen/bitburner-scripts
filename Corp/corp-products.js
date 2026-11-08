@@ -33,13 +33,26 @@
  * corporation.ts (779-856) - logic only.
  */
 import { formatMoney, getConfiguration } from "../helpers.js";
-import { TOB_NAME, alreadyRunning, corpLog } from "./corp-lib.js";
+import { TOB_NAME, alreadyRunning, corpLog, readBnProfile } from "./corp-lib.js";
 import { allowedProductCeiling, nextProductName, parseProductId } from "./corp-formulas.js";
 
 const WARN_INTERVAL = 50; // re-log the same WARN / the profit skip at most once per this many cycles
 const PROFIT_SKIP = 1e40; // reference corporation.ts ~840: past this profit a new product adds nothing...
 const FUNDS_RESUME = 1e72; // ...until the funds are back over 1e72, where the budget is floored at 1e72 too
-const MIN_PRODUCT_BUDGET = 1e3; // nextProductName (and the game) refuse a budget below this
+const MIN_PRODUCT_BUDGET = 1e3; // §4.3: under this the investment is noise - develop a product when the funds allow
+// §19.4.2 p79: offer 4 >= 1e20 is the round-4 milestone. The guide's own fallback for a corp that cannot reach
+// it with the round's two products is a bigger P/P setup (1P/3P, 2P/4P) - both spend the extra products in ROUND
+// 4, and its sample log develops a 3rd product before offer 4 - so ONE product past the round-4 ceiling is
+// allowed while the offer is still this far below the milestone. A product's RATING is what drives the profit
+// (ratings are frozen at creation, so two cheap early products can never grow into the offer), which is exactly
+// the case that fallback exists for. `div.maxProducts` (3 without the Capacity research) caps it anyway, and the
+// fraction is the knob: a corp whose offer already clears it is developing on plan and gets no extra product.
+const ROUND_4_MILESTONE = 1e20; // BN3 figure - scaled by T08's profile.offerScale below
+// The same 80% line T14 uses as its accept floor (FAQ p10): while the offer is NOT acceptable, the round's
+// products have provably not got the corp to the milestone, so keep developing. Once the offer IS acceptable
+// T13 must not start anything - a product in development closes T14's all-products-finished gate for its whole
+// duration, which would delay the accept instead of helping it.
+const BEHIND_MILESTONE_FRACTION = 0.8;
 const argsSchema = [
     ["product-city", "Sector-12"], // the city whose office develops the products
     ["budget-share", 0.01], // §4.3: 1% of the current funds per product
@@ -126,10 +139,18 @@ export function runCycle(ns, cfg, mem) {
     const named = div.products.map(parseProductId).filter(Number.isFinite);
     const developed = named.length === 0 ? 0 : Math.max(...named) + 1;
     const ceiling = allowedProductCeiling(offerRound);
-    if (ceiling !== Infinity && Math.max(developed, div.products.length) >= ceiling) {
+    const offerScale = Number(readBnProfile(ns).offerScale ?? 1);
+    const behind = offerRound === 4 && offer.funds < ROUND_4_MILESTONE * offerScale * BEHIND_MILESTONE_FRACTION;
+    // At the division's hard cap (maxProducts = 3 without the Capacity research) there is no free slot to ADD to,
+    // but a replacement is still a better product: the make step below discontinues the worst-rated one first.
+    // That is how the guide's own run reached "1e20/s after the 4th/5th product" - its log develops product
+    // 00003 before offer 4 - and the replacement is created with today's much stronger offices and RP pool.
+    const replace = behind && div.products.length >= div.maxProducts;
+    const cap = behind ? ceiling + 1 : ceiling;
+    if (cap !== Infinity && !replace && Math.max(developed, div.products.length) >= cap) {
         if (!mem.waiting.has(offerRound)) {
             mem.waiting.add(offerRound);
-            corpLog(ns, `${division}: round ${offerRound} develops ${ceiling} product(s), ${developed} done - waiting for the offer before developing more`);
+            corpLog(ns, `${division}: round ${offerRound} develops ${cap} product(s), ${developed} done - waiting for the offer before developing more`);
         }
         return;
     }
@@ -149,8 +170,10 @@ export function runCycle(ns, cfg, mem) {
         return;
     }
 
-    // Step 6: budget (§4.3: 1% of the current funds) and the make itself. The name carries the TOTAL budget
-    // while the game gets half as design and half as marketing investment (reference: makeProduct(..., b/2, b/2)).
+    // Step 6: budget (§4.3: 1% of the current funds) and the make itself. The game gets half the budget as
+    // design and half as marketing investment (reference: makeProduct(..., b/2, b/2)); the NAME is only the
+    // division plus a running number ("Ebon Stick-16"), which nextProductName continues past every product the
+    // division already has - so a replacement, which is made right after a discontinue, cannot collide.
     let budget = funds * cfg.budgetShare;
     if (funds >= FUNDS_RESUME) budget = Math.max(budget, FUNDS_RESUME); // reference: a 1% budget is noise this late
     if (!(budget >= MIN_PRODUCT_BUDGET)) {
@@ -164,10 +187,10 @@ export function runCycle(ns, cfg, mem) {
         ns.corporation.discontinueProduct(division, worst.name);
         corpLog(ns, `${division}: discontinued ${worst.name} (rating ${worst.rating}) - ${div.products.length} products is the cap`);
     }
-    const name = nextProductName(div.products, division, budget); // THROWS under 1e3, guarded above
+    const name = nextProductName(div.products, division);
     const invest = budget / 2;
     ns.corporation.makeProduct(division, cfg.productCity, name, invest, invest); // THROWS when short of funds
-    corpLog(ns, `New product ${name} budget ${formatMoney(budget)}`);
+    corpLog(ns, `New product ${name} budget ${formatMoney(budget)}${behind ? " (extra product: the offer is under half the round-4 milestone - §19.4.2's 1P/3P fallback)" : ""}`);
 }
 
 /** Step 7: getProduct needs the CITY. A product that is still being created may throw - that is "not
@@ -238,7 +261,9 @@ const CFG = { productCity: "Sector-12", budgetShare: 0.01, division: TOB_NAME };
 
 /** Runnable check (no game needed):
  *   node --input-type=module -e "import('./Corp/corp-products.js').then(m=>m.selfCheck()).then(r=>console.log('selfCheck:',r))"
- * Throws on the first failure. Proves the product state machine with a mock NS - NOT in-game correctness. **/
+ * Throws on the first failure. Proves the product state machine with a mock NS - NOT in-game correctness.
+ * The fixtures keep the OLD "Ebon Stick-00000-1.00000e+9" names on purpose: those are the products already in
+ * the game, and parseProductId has to keep numbering past them. **/
 export function selfCheck() {
     const must = (ok, label) => {
         if (!ok) throw new Error(`selfCheck: ${label}`);
@@ -249,10 +274,10 @@ export function selfCheck() {
         return { ns, mem };
     };
 
-    // Round 3, nothing developed yet: one product, name id 00000, total budget 1e9 split evenly.
+    // Round 3, nothing developed yet: one product, the first name of the division, total budget 1e9 split evenly.
     let r = run(fakeState());
     must(r.ns.calls.make.length === 1, `empty division develops one product, got ${r.ns.calls.make.length}`);
-    must(r.ns.calls.make[0].name === "Ebon Stick-00000-1.00000e+9", `name ${r.ns.calls.make[0].name}`);
+    must(r.ns.calls.make[0].name === "Ebon Stick-0", `name ${r.ns.calls.make[0].name}`);
     must(r.ns.calls.make[0].design === 5e8 && r.ns.calls.make[0].marketing === 5e8, `half design / half marketing: ${JSON.stringify(r.ns.calls.make[0])}`);
     must(r.ns.calls.make[0].city === "Sector-12" && r.ns.calls.discontinue.length === 0, "product city + nothing discontinued");
 
@@ -274,7 +299,7 @@ export function selfCheck() {
 
     // Round 4: the second product is allowed, numbered after the first.
     r = run(fakeState({ round: 4, offerFunds: 1e20, products: [product("Ebon Stick-00000-1.00000e+9")] }));
-    must(r.ns.calls.make.length === 1 && r.ns.calls.make[0].name === "Ebon Stick-00001-1.00000e+9", `round 4 second product: ${JSON.stringify(r.ns.calls.make)}`);
+    must(r.ns.calls.make.length === 1 && r.ns.calls.make[0].name === "Ebon Stick-1", `round 4 second product: ${JSON.stringify(r.ns.calls.make)}`);
     // ...and a third is not (2P).
     r = run(
         fakeState({
@@ -285,12 +310,38 @@ export function selfCheck() {
     );
     must(r.ns.calls.make.length === 0, "round 4 ceiling blocks the third product");
 
+    // ...but a corp whose round-4 offer is nowhere near the milestone - its two products were developed with the
+    // early, cheap offices, and a product's rating is frozen at creation - gets ONE more product: the guide's own
+    // fallback (1P/3P / 2P/4P). A healthy corp is untouched, because its offer is already over half of 1e20.
+    const twoProducts = [product("Ebon Stick-00000-1.00000e+9"), product("Ebon Stick-00001-1.00000e+9")];
+    r = run(fakeState({ round: 4, offerFunds: 9e16, products: twoProducts }));
+    must(
+        r.ns.calls.make.length === 1 && r.ns.calls.make[0].name === "Ebon Stick-2",
+        `round 4 extra product below the milestone: ${JSON.stringify(r.ns.calls.make)}`,
+    );
+    // At the division's hard cap (3 without the Capacity research) the extra product is a REPLACEMENT: the make
+    // step discontinues the worst-rated product to free the slot, which is how the guide's own log reached product
+    // 00003 before offer 4 ("1e20/s after the 4th/5th product"). The replacement is created with today's much
+    // stronger offices and RP pool, so its rating - and with it the profit - jumps.
+    const atCap = [
+        product("Ebon Stick-00000-1.00000e+9", 100, 30),
+        product("Ebon Stick-00001-1.00000e+9", 100, 10),
+        product("Ebon Stick-00002-1.00000e+9", 100, 20),
+    ];
+    r = run(fakeState({ round: 4, offerFunds: 9e16, products: atCap }));
+    must(r.ns.calls.discontinue.length === 1 && r.ns.calls.discontinue[0].name === "Ebon Stick-00001-1.00000e+9", `the replacement frees a slot: ${JSON.stringify(r.ns.calls.discontinue)}`);
+    must(r.ns.calls.make.length === 1 && r.ns.calls.make[0].name === "Ebon Stick-3", `the 4th product: ${JSON.stringify(r.ns.calls.make)}`);
+    // ...and once the offer IS acceptable (the 80% floor T14 accepts at) no product is touched: a product in
+    // development would close T14's all-products-finished gate for its whole duration.
+    r = run(fakeState({ round: 4, offerFunds: 9e19, products: atCap }));
+    must(r.ns.calls.make.length === 0 && r.ns.calls.discontinue.length === 0, "no product work once the offer is acceptable");
+
     // After offer 4 (funds 0 -> round 5): unconditional development, capped by maxProducts -> the worst
     // (lowest rating) product is discontinued to free the slot.
     const three = [product("Ebon Stick-00000-1.00000e+9", 100, 30), product("Ebon Stick-00001-1.00000e+9", 100, 10), product("Ebon Stick-00002-1.00000e+9", 100, 20)];
     r = run(fakeState({ round: 5, offerFunds: 0, products: three }));
     must(r.ns.calls.discontinue.length === 1 && r.ns.calls.discontinue[0].name === "Ebon Stick-00001-1.00000e+9", `discontinues the lowest rating: ${JSON.stringify(r.ns.calls.discontinue)}`);
-    must(r.ns.calls.make.length === 1 && r.ns.calls.make[0].name === "Ebon Stick-00003-1.00000e+9", `next id after the cap: ${JSON.stringify(r.ns.calls.make)}`);
+    must(r.ns.calls.make.length === 1 && r.ns.calls.make[0].name === "Ebon Stick-3", `next id after the cap: ${JSON.stringify(r.ns.calls.make)}`);
 
     // The old hand-made name cannot be numbered, but it still occupies a product slot.
     r = run(
@@ -301,7 +352,7 @@ export function selfCheck() {
         }),
     );
     must(r.ns.calls.discontinue.length === 1 && r.ns.calls.discontinue[0].name === "BIG CIG", `non-conforming name counts and is the worst: ${JSON.stringify(r.ns.calls.discontinue)}`);
-    must(r.ns.calls.make[0].name === "Ebon Stick-00002-1.00000e+9", `numbering ignores "BIG CIG": ${r.ns.calls.make[0].name}`);
+    must(r.ns.calls.make[0].name === "Ebon Stick-2", `numbering ignores "BIG CIG": ${r.ns.calls.make[0].name}`);
 
     // Profit rule (reference): 1e40/s or less still develops; above it only once the funds are back over 1e72.
     r = run(fakeState({ round: 5, offerFunds: 0, revenue: 1e40, expenses: 0, products: three }));

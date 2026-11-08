@@ -166,7 +166,7 @@ function developFirstProduct(ns, cfg, round) {
         corpLog(ns, `${TOB_NAME}: cannot invest ${formatMoney(cfg.firstProductBudget)} in a product, ${formatMoney(funds)} available`, "ERROR");
         return null;
     }
-    const name = nextProductName(division.products, TOB_NAME, cfg.firstProductBudget);
+    const name = nextProductName(division.products, TOB_NAME);
     const invest = cfg.firstProductBudget / 2;
     ns.corporation.makeProduct(TOB_NAME, cfg.productCity, name, invest, invest); // THROWS only when short of funds, checked above
     return name;

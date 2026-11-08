@@ -16,17 +16,26 @@
  * "the round's product count is reached AND every product has finished". After offer 4 (round 5) the same
  * cyclic check turns into "go public, then issue the dividend" - once.
  *
+ * That same post-public branch is where the bribe lives: on a BitNode whose CorporationSoftcap < 1 the dividend
+ * transfer is crushed (`payout^(softcap-0.15)`, Corporation.ts getCycleDividends) to the point where
+ * `ns.corporation.bribe` (a flat 1e9 corporation funds per reputation) beats dividend -> donation (1e6 per rep,
+ * Faction/formulas/donation.ts), so `--bribe-share` of each cycle's PROFIT goes to the factions
+ * faction-manager.js still needs augmentations from (`/Temp/affordable-augs.txt` -> `rep_needed_by_faction`,
+ * written at faction-manager.js:222). Additive to the dividend - never a replacement - and derived from profit,
+ * so the offers' seed capital (which sits in `funds`) can never be spent on it. `--bribe-share 0` disables it.
+ *
  * Distinct ns.corporation.* APIs referenced by THIS file (docs figures from CONTEXT §4, NOT measured - `mem`):
- *   0 GB : hasCorporation nextUpdate
+ *   0 GB : hasCorporation nextUpdate getConstants
  *   10 GB: getCorporation getDivision getInvestmentOffer getOffice getProduct
- *   20 GB: acceptInvestmentOffer goPublic issueDividends setJobAssignment
- *   => 5 x 10 GB + 4 x 20 GB = 130 GB for the corporation API alone, plus the imports: helpers.js (~16.4 GB),
+ *   20 GB: acceptInvestmentOffer goPublic issueDividends setJobAssignment bribe
+ *   => 5 x 10 GB + 5 x 20 GB = 150 GB for the corporation API alone, plus ns.getPlayer() 0.5 GB (the joined
+ *      factions the bribe targets must be members of) and the imports: helpers.js (~16.4 GB),
  *      corp-lib.js (ns.run 1, ns.getScriptRam 0.1, ns.isRunning 0.1, ns.getServerMaxRam/UsedRam 0.05 each,
  *      rest 0 GB) and corp-formulas.js (pure, 0 GB). Deliberately does NOT import Corp/corp-ops.js: its
  *      13-read/16-action union would blow this service's budget for four small inline helpers (assignJobs,
  *      waitForOffer, acceptOffer) that cost nothing extra - all four calls they need are already in the list
  *      above. `acceptInvestmentOffer` needs an offer; `issueDividends` needs a public corporation; both are
- *      wrapped.
+ *      wrapped. docs sum ~168 GB.
  *
  * Guide refs: §17.3 p64 (Offer = Valuation x FundingRoundShares[0.1,0.35,0.25,0.2] x
  * FundingRoundMultiplier[3,2,2,1.5] - milestone values offer 3 >= 1e16, offer 4 >= 1e20), §17.2 p63
@@ -44,6 +53,7 @@ import { BN_FILE, JOBS, OFFER_PREP_FILE, TOB_NAME, alreadyRunning, corpLog, offe
 import { allowedProductCeiling, parseProductId, ratiosToCounts } from "./corp-formulas.js";
 
 const OFFICES_SCRIPT = "Corp/corp-offices.js"; // T19 (P4): restores the normal office setup after an offer
+const AUG_GOALS_FILE = "/Temp/affordable-augs.txt"; // written by ../faction-manager.js:17 (same literal as autopilot.js:136)
 const RESTORE_NORMAL_ARGS = ["--restore-normal"];
 const PREP_PROGRESS_LOW = 98; // reference corporation.ts 772-777: newest product progress in (98,100) => almost done
 const OFFER_WAIT_CYCLES = 10; // reference waitForOffer(ns, 10, 5, expected)
@@ -65,6 +75,8 @@ const argsSchema = [
     ["dividend-rate", 0.5], // §17.4: 0..1; only issued after offer 4 (a higher rate lowers the valuation)
     ["go-public", true], // §17.5 p64: going public is what makes the dividend (and the money) exist
     ["min-fraction", 0.8], // refuse an offer below this fraction of the expected one (FAQ p10: "below 80%")
+    ["bribe-share", 0.1], // post-public + harsh-softcap nodes only: share of each market cycle's PROFIT converted to faction reputation via ns.corporation.bribe (additive to --dividend-rate; the two together must stay < 1)
+    ["bribe-faction", ""], // comma-separated faction names to bribe instead of faction-manager.js's aug goals; empty = use the goals
 ];
 
 export function autocomplete(data, _) {
@@ -112,6 +124,54 @@ export function offerGate(products, offerRound, mode = "GENERIC") {
     return { open, developed: count, ceiling, allFinished };
 }
 
+/** Is this BitNode's dividend transfer harsh enough that a flat faction bribe beats it?
+ *
+ * The player receives `(dividend payout)^(softcap - 0.15)` (Corporation.getCycleDividends:
+ * `Math.pow(dividends, 1 - tributeModifier)`, tributeModifier = 1 - CorporationSoftcap + 0.15), while a bribe
+ * pays a flat `bribeAmountPerReputation` (1e9) of corporation funds per reputation
+ * (Corporation/Actions.ts bribe). Spending S of corporation funds therefore buys `S/1e9` rep as a bribe but
+ * `S^(softcap-0.15)/1e6` rep through dividend -> donation (Faction/formulas/donation.ts), so the bribe only
+ * wins above S = 10^(3/(1-e)) with e = softcap - 0.15:
+ *   softcap 1.00 (e=0.85, BN1/3/4/5)     -> 1e20  : unreachable - the dividend always wins
+ *   softcap 0.90 (e=0.75, BN2/6/7/10/11) -> 1e12  : a matured public corporation exceeds this
+ *   softcap 0.80 (e=0.65, BN12)          -> 4e8
+ *   softcap 0.75 (e=0.60, BN9)           -> 3e7
+ *   softcap 0.40 (e=0.25, BN13)          -> 1e4   : the dividend route is dead
+ * so "harsh" is simply "the node haircuts the dividend transfer at all". Pure - checked below. **/
+export function softcapIsHarsh(softcap) {
+    return Number(softcap ?? 1) < 1;
+}
+
+/** The post-public bribe for THIS cycle: which factions, how much each, or why not. PURE.
+ *
+ * The budget is `--bribe-share` of ONE market cycle's profit - the same anchor the game uses for dividends
+ * (`getCycleDividends`: dividendRate x cycleProfit), which is what makes this an addition to the dividend
+ * rather than a replacement, and what keeps the offers' seed capital (which sits in `funds`) out of it.
+ * @param {{public:boolean, funds:number, revenue:number, expenses:number, valuation:number, dividendRate:number}} corp
+ * @param {object} cfg {softcap, bribeShare, bribeThreshold, bribeAmountPerReputation, secondsPerMarketCycle, dividendRate}
+ * @param {string[]} factions goal factions for this cycle (see bribeTargets)
+ * @returns {{online:boolean, why:string, targets:{faction:string, amount:number}[]}} **/
+export function bribePlan(corp, cfg, factions) {
+    const off = (why) => ({ online: false, why, targets: [] });
+    if (!corp?.public) return off("still pre-offer - the dividend alone until the offers are done");
+    if (!softcapIsHarsh(cfg.softcap)) return off(`softcap ${cfg.softcap} is not harsh - the dividend already pays`);
+    if (!(cfg.bribeShare > 0)) return off("--bribe-share 0");
+    // On the cycle the corporation goes public the live dividendRate is still 0, so the configured one is the
+    // number that matters there (issueDividends runs in the same cycle, before this).
+    const rate = Math.max(Number(corp.dividendRate ?? 0), Number(cfg.dividendRate ?? 0));
+    if (cfg.bribeShare + rate >= 1) return off(`--bribe-share ${cfg.bribeShare} + dividend ${rate} would spend the whole profit`);
+    if (Number(corp.valuation) < cfg.bribeThreshold) return off(`valuation is under the game's bribe threshold ${formatMoney(cfg.bribeThreshold)}`);
+    const profit = Number(corp.revenue ?? 0) - Number(corp.expenses ?? 0);
+    if (!(profit > 0)) return off("no profit to share");
+    if (!factions.length) return off("no faction to bribe");
+    const spend = profit * cfg.secondsPerMarketCycle * cfg.bribeShare;
+    if (spend > corp.funds) return off(`this cycle's share ${formatMoney(spend)} is more than the corporation holds (${formatMoney(corp.funds)})`);
+    const perFaction = Math.floor(spend / factions.length);
+    if (perFaction < cfg.bribeAmountPerReputation) // less than one whole reputation point per faction is money thrown away
+        return off(`this cycle's share ${formatMoney(perFaction)} per faction is under one reputation (${formatMoney(cfg.bribeAmountPerReputation)})`);
+    return { online: true, why: "", targets: factions.map((faction) => ({ faction, amount: perFaction })) };
+}
+
 /** Session memory of the running service. Every decision is re-derived from the game, so a restart costs
  * nothing but a repeated log line; this only stops duplicate INFO/WARN/MILESTONE spam. **/
 function newMemory() {
@@ -120,6 +180,9 @@ function newMemory() {
         accepted: new Set(), // offer rounds already accepted (belt and braces against a double accept)
         waiting: new Set(), // rounds whose "waiting" line was already printed
         warned: new Map(), // warn key -> the cycle it was last logged
+        bribed: 0, // successful bribes this run (first-success MILESTONE + the throttled summary)
+        bribedSpent: 0,
+        bribeFailed: new Set(), // factions that refused this run - asked at most once per run
     };
 }
 
@@ -138,6 +201,7 @@ export async function main(ns) {
     }
     const offerScale = Number(profile?.offerScale ?? 1);
     const mode = offerMode(offerScale); // LOW on a BitNode whose CorporationValuation is < 0.3, see corp-lib
+    const constants = ns.corporation.getConstants(); // 0 GB; bribeThreshold / bribeAmountPerReputation / secondsPerMarketCycle
 
     const cfg = {
         productCity: String(options["product-city"]),
@@ -147,6 +211,12 @@ export async function main(ns) {
         offerScale: offerScale,
         mode: mode,
         division: TOB_NAME,
+        softcap: Number(profile?.softcap ?? 1), // T08: a harsh softcap crushes the dividend transfer, the bribe pays
+        bribeShare: Number(options["bribe-share"]),
+        bribeFactions: String(options["bribe-faction"]).split(",").map((s) => s.trim()).filter(Boolean),
+        bribeThreshold: constants.bribeThreshold,
+        bribeAmountPerReputation: constants.bribeAmountPerReputation,
+        secondsPerMarketCycle: constants.secondsPerMarketCycle,
     };
     if (!(offerScale > 0)) {
         corpLog(ns, `offerScale is ${offerScale} (BN8 or no CorporationValuation): offers are worthless here - not accepting any offer`, "ERROR");
@@ -155,7 +225,7 @@ export async function main(ns) {
     const mem = newMemory();
     corpLog(
         ns,
-        `offer service starting (division=${cfg.division}, product-city=${cfg.productCity}, offerScale=${offerScale}, mode=${mode}, go-public=${cfg.goPublic}, dividend-rate=${cfg.dividendRate}, min-fraction=${cfg.minFraction})`,
+        `offer service starting (division=${cfg.division}, product-city=${cfg.productCity}, offerScale=${offerScale}, mode=${mode}, go-public=${cfg.goPublic}, dividend-rate=${cfg.dividendRate}, min-fraction=${cfg.minFraction}, softcap=${cfg.softcap}, bribe-share=${cfg.bribeShare})`,
     );
 
     while (true) {
@@ -195,6 +265,7 @@ export async function runCycle(ns, cfg, mem) {
     // Step 6: all four rounds are taken (or the corporation is already public) -> go public + set the dividend.
     if (offerRound > 4 || corp.public) {
         goPublicAndDividends(ns, cfg, corp, mem);
+        bribeFromProfit(ns, cfg, corp, mem); // post-public money-out: --bribe-share of the profit -> faction rep
         return;
     }
 
@@ -215,20 +286,34 @@ export async function runCycle(ns, cfg, mem) {
     // while we are already preparing to accept, OFFER_PREP_FILE is "1" so T19 leaves the product division's
     // office jobs alone (the reference's documented race, corporation.ts 688-690). Cleared in step 5.
     const gate = offerGate(products, offerRound, cfg.mode);
-    if (gate.open || (newest !== null && newest.developmentProgress > PREP_PROGRESS_LOW && newest.developmentProgress < 100)) {
-        writeFlag(ns, OFFER_PREP_FILE, "1");
-    } else {
-        // The imminent-offer condition ended without an accept. Round 4 develops several products, so the newest
-        // one leaving its last 2% (or being replaced) must NOT latch the flag: T18 would skip that division's
-        // offices for the rest of the round. writeFlag() compares first, so this costs one 0 GB read per cycle.
-        writeFlag(ns, OFFER_PREP_FILE, "0");
-    }
+    // LOW: no amount is targeted (the guide writer: on such a node the offer is a fraction of the guide's
+    // number), so everything is "in reach" and acceptOffer(0) takes whatever is on the table.
+    const expected = cfg.mode === "LOW" ? 0 : expectedOfferFor(offerRound, cfg.offerScale);
+    const newestMidway = newest !== null && newest.developmentProgress > PREP_PROGRESS_LOW && newest.developmentProgress < 100;
+    // The guide switches to the profit setup "right before accepting offer" (§19.4.2 p78) - i.e. when the offer
+    // is already worth taking. While it is out of reach there is nothing to squeeze, and the profit setup (plus
+    // the prep flag that goes with it) freezes the division's Engineer work AND its R&D offices for as long as
+    // the offer stays low: T18 skips the offices step and T19 never re-staffs them, so no research points
+    // accumulate and no office size is bought. In-game that pinned a round-4 corp to the rich 68/12/244/45
+    // ratio with R&D 0 in all six cities for hours (tobacco RP stuck at 17k) while the offer was ~1000x under
+    // the round's milestone - the freeze was the reason it could not grow into the offer.
+    const inReach = gate.open && offer.funds >= expected * cfg.minFraction;
+    writeFlag(ns, OFFER_PREP_FILE, inReach || newestMidway ? "1" : "0");
     if (!gate.open) {
         warnOnce(
             ns,
             mem,
             `gate:${offerRound}`,
             `${division}: round ${offerRound} accepts at ${gate.ceiling} product(s) fully developed, ${gate.developed} developed, all finished: ${gate.allFinished}`,
+        );
+        return;
+    }
+    if (!inReach) {
+        warnOnce(
+            ns,
+            mem,
+            `reach:${offerRound}`,
+            `${division}: round ${offerRound} offer ${formatMoney(offer.funds)} is under ${formatMoney(expected * cfg.minFraction)} - leaving the round's own office setup in place (Engineer production + R&D) instead of the profit setup until the offer is in reach`,
         );
         return;
     }
@@ -243,11 +328,14 @@ export async function runCycle(ns, cfg, mem) {
     // Step 4: switch the product division to the "profit" setup (main office + support offices), then let the
     // offer grow (it is driven by the last cycles' profit) and accept it.
     applyProfitSetup(ns, division, cfg.productCity, offerRound);
-    // LOW: no amount is targeted (the guide writer: on such a node the offer is a fraction of the guide's
-    // number) - the peak wait above is the whole condition and acceptOffer(0) takes whatever is on the table.
-    const expected = cfg.mode === "LOW" ? 0 : expectedOfferFor(offerRound, cfg.offerScale);
     await waitForOffer(ns, OFFER_WAIT_CYCLES, OFFER_WAIT_EXTRA, expected); // lets the offer grow on the profit setup
-    if (!acceptOffer(ns, offerRound, expected, cfg.minFraction)) return; // below the floor: retry next cycle
+    if (!acceptOffer(ns, offerRound, expected, cfg.minFraction)) {
+        // Below the floor after all (the offer can dip while we wait): hand the offices back, so the corp keeps
+        // producing and researching instead of sitting in the profit setup until the next attempt.
+        writeFlag(ns, OFFER_PREP_FILE, "0");
+        await restoreNormalSetup(ns, division);
+        return;
+    }
     mem.accepted.add(offerRound);
 
     // Acceptance 3: the round is re-read after the accept. When the game consumed the offer it has advanced
@@ -418,6 +506,76 @@ function readProduct(ns, division, city, name) {
     }
 }
 
+/** faction-manager.js's aug-goal summary out of /Temp/affordable-augs.txt (0 GB read), or null when it is
+ * missing / empty / unreadable. autopilot.js reads the same file (getFactionManagerOutput). **/
+function readAugGoals(ns) {
+    try {
+        return JSON.parse(ns.read(AUG_GOALS_FILE)) ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/** Which factions may be bribed this cycle: `--bribe-faction "A,B"` when given, otherwise the factions
+ * faction-manager.js still needs reputation with (`rep_needed_by_faction`) - that map is its "augs we still
+ * want" goal, so it self-terminates per faction once that faction's reputation covers what it offers, and it
+ * never lists a faction whose augs are all owned. Both paths keep only factions we are actually in (the game
+ * requires membership) and drop the ones the game has already refused this run.
+ * ponytail: the goal file carries no timestamp, so a stale-but-present file keeps targeting last run's
+ * factions; add an `asOf` key to it if that ever shows up in-game. **/
+function bribeTargets(ns, cfg, mem) {
+    const joined = ns.getPlayer().factions ?? [];
+    const want = (faction) => joined.includes(faction) && !mem.bribeFailed.has(faction);
+    if (cfg.bribeFactions.length) return cfg.bribeFactions.filter(want);
+    const goals = readAugGoals(ns);
+    if (!goals) {
+        if (mem.cycle % WARN_INTERVAL === 0) corpLog(ns, `no aug goals from faction-manager.js yet (${AUG_GOALS_FILE}) - nothing to bribe for`);
+        return [];
+    }
+    return Object.keys(goals.rep_needed_by_faction ?? {}).filter(want);
+}
+
+/** Post-public money-out step: convert `--bribe-share` of this cycle's PROFIT into faction reputation for the
+ * factions we still need augs from. Additive to the dividend (a second share of the same profit, never a
+ * replacement - see bribePlan for why a bribe pays where the dividend transfer is haircut), and never the
+ * offers' seed capital, which sits in `funds` and is only read as a floor. Runs once per cycle from runCycle;
+ * every gate is re-derived from the game each cycle, so a restart costs nothing. **/
+function bribeFromProfit(ns, cfg, corp, mem) {
+    const plan = bribePlan(corp, cfg, bribeTargets(ns, cfg, mem));
+    if (!plan.online) {
+        if (mem.cycle % WARN_INTERVAL === 0) corpLog(ns, `no faction bribes this cycle: ${plan.why}`);
+        return;
+    }
+    let factionsBribed = 0;
+    let spent = 0;
+    for (const { faction, amount } of plan.targets) {
+        let accepted = false;
+        try {
+            accepted = ns.corporation.bribe(faction, amount); // 20 GB; returns false (never throws) for a refused faction
+        } catch (e) {
+            mem.bribeFailed.add(faction);
+            warnOnce(ns, mem, `bribe-threw:${faction}`, `bribe(${faction}, ${formatMoney(amount)}) threw: ${e?.message ?? e}`);
+            continue;
+        }
+        if (!accepted) {
+            mem.bribeFailed.add(faction);
+            warnOnce(ns, mem, `bribe-refused:${faction}`, `${faction} refused a bribe of ${formatMoney(amount)} - skipping it for this run`);
+            continue;
+        }
+        factionsBribed++;
+        spent += amount;
+    }
+    if (factionsBribed === 0) return;
+    const firstOfRun = mem.bribed === 0;
+    mem.bribed += factionsBribed;
+    mem.bribedSpent += spent;
+    // Event line, not a healthcheck: the first bribe of a run is the one the player must not have to look for.
+    if (firstOfRun)
+        corpLog(ns, `first faction bribe: ${factionsBribed} faction(s) for ${formatMoney(spent)} (~${formatMoney(spent / cfg.bribeAmountPerReputation)} rep)`, "MILESTONE");
+    else if (mem.cycle % 20 === 0)
+        corpLog(ns, `bribed ${factionsBribed} faction(s), spent≈${formatMoney(spent)}, ~${formatMoney(spent / cfg.bribeAmountPerReputation)} rep; total ${formatMoney(mem.bribedSpent)}`);
+}
+
 /** corpLog a WARN at most once per `key` per WARN_INTERVAL cycles, and once for a fixed warning. **/
 function warnOnce(ns, mem, key, message) {
     const last = mem.warned.get(key);
@@ -433,9 +591,9 @@ function warnOnce(ns, mem, key, message) {
  * semantics (absolute count, counted against the PENDING assignment, throws when there are not enough
  * Unassigned employees); nextUpdate() makes the pending assignment live, like a START does. **/
 function mockNs(state) {
-    const calls = { setJob: [], accept: 0, goPublic: [], dividends: [] };
+    const calls = { setJob: [], accept: 0, goPublic: [], dividends: [], bribe: [] };
     const lines = [];
-    const files = { [OFFER_PREP_FILE]: state.prepFlag ?? "" };
+    const files = { [OFFER_PREP_FILE]: state.prepFlag ?? "", [AUG_GOALS_FILE]: state.augGoals ?? "" };
     const offices = Object.fromEntries(
         Object.entries(state.offices).map(([city, o]) => {
             const pending = {};
@@ -450,6 +608,7 @@ function mockNs(state) {
         files,
         print: () => {},
         getScriptName: () => "Corp/corp-offers.js",
+        getPlayer: () => ({ factions: state.factions ?? [] }),
         getPortHandle: () => ({ write: (line) => lines.push(line) }),
         fileExists: () => state.officesScript === true,
         read: (file) => files[file] ?? "",
@@ -499,6 +658,10 @@ function mockNs(state) {
                 return true;
             },
             issueDividends: (rate) => calls.dividends.push(rate),
+            bribe: (faction, amount) => {
+                calls.bribe.push({ faction, amount });
+                return !(state.bribeRefuses ?? []).includes(faction);
+            },
         },
     };
 }
@@ -508,7 +671,8 @@ const product = (name, developmentProgress = 100, effectiveRating = 1) => ({ nam
 /** A round-3/4 Tobacco corporation: Sector-12 main office (138 employees, all R&D) + one support office. **/
 function fakeState({ products = [], ...rest } = {}) {
     return {
-        corp: { funds: 1e12, divisions: [TOB_NAME], public: false },
+        corp: { funds: 1e12, divisions: [TOB_NAME], public: false, revenue: 0, expenses: 0, valuation: 1e14, dividendRate: 0.5 },
+        factions: ["CyberSec", "NiteSec"],
         round: 3,
         offerFunds: 1e16,
         offices: { "Sector-12": { size: 138 }, Aevum: { size: 33 } },
@@ -517,7 +681,7 @@ function fakeState({ products = [], ...rest } = {}) {
     };
 }
 
-const CFG = { productCity: "Sector-12", dividendRate: 0.5, goPublic: true, minFraction: 0.8, offerScale: 1, mode: "GENERIC", division: TOB_NAME };
+const CFG = { productCity: "Sector-12", dividendRate: 0.5, goPublic: true, minFraction: 0.8, offerScale: 1, mode: "GENERIC", division: TOB_NAME, softcap: 1, bribeShare: 0.1, bribeFactions: [], bribeThreshold: 100e12, bribeAmountPerReputation: 1e9, secondsPerMarketCycle: 10 };
 
 /** Runnable check (no game needed):
  *   node --input-type=module -e "import('./Corp/corp-offers.js').then(m=>m.selfCheck()).then(r=>console.log('selfCheck:',r))"
@@ -562,7 +726,8 @@ export async function selfCheck() {
     same(expectedOfferFor(3, 1), 1e16, "expectedOfferFor(3, 1)");
     same(expectedOfferFor(4, 0.001), 1e17, "expectedOfferFor(4, 0.001)");
 
-    // The product-count gate (1P/2P).
+    // The product-count gate (1P/2P). The fixtures carry the pre-2026-11-08 long names on purpose: those are
+    // the products already in the game, and parseProductId still numbers past them.
     const done = (id) => product(`Ebon Stick-0000${id}-1.00000e+9`);
     must(!offerGate([], 3).open, "round 3 with no product is closed");
     must(!offerGate([product("Ebon Stick-00000-1.00000e+9", 42)], 3).open, "round 3 with a developing product is closed");
@@ -615,13 +780,19 @@ export async function selfCheck() {
     r = await run(fakeState({ products: [product("Ebon Stick-00000-1.00000e+9", 100, 0)] }));
     must(r.ns.calls.accept === 0 && r.ns.calls.setJob.length === 0, "effectiveRating 0 waits");
 
-    // An offer under the floor is refused, not accepted (FAQ p10), and the profit setup stays in place.
+    // An offer under the floor is neither prepared for nor accepted (FAQ p10). The profit setup must NOT be
+    // applied: holding it (plus the prep flag that goes with it) freezes the division's Engineer work and its
+    // R&D offices, which is exactly what a corp that cannot reach the round's milestone needs to grow - it
+    // pinned a round-4 corp in-game for hours (R&D 0 everywhere, tobacco RP stuck at 17k).
     r = await run(fakeState({ offerFunds: 1e15, products: [done(0)] }));
     must(r.ns.calls.accept === 0, "an offer under 80% is refused");
-    must(r.ns.lines.some((l) => l.includes("refused round 3 offer")), `refusal is logged: ${r.ns.lines}`);
-    // A below-floor offer is a normal waiting condition, and the wait above already WARNed that the offer is
-    // under the expected one - the refusal must not also be an ERROR (the daemon tprints every ERROR).
-    must(!r.ns.lines.some((l) => l.includes("refused round 3 offer") && l.includes("|ERROR|")), `refusal is not an ERROR: ${r.ns.lines}`);
+    must(r.ns.calls.setJob.length === 0, "an out-of-reach offer does not switch the offices to the profit setup");
+    must(r.ns.files[OFFER_PREP_FILE] === "0", `the prep flag stays clear: ${r.ns.files[OFFER_PREP_FILE]}`);
+    must(r.ns.lines.some((l) => l.includes("leaving the round's own office setup")), `the reach gate is logged: ${r.ns.lines}`);
+    must(!r.ns.lines.some((l) => l.includes("|ERROR|")), `the reach gate is not an ERROR: ${r.ns.lines}`);
+    // ...and an offer that IS within reach still gets the profit setup and the accept.
+    r = await run(fakeState({ offerFunds: 9e15, products: [done(0)] }));
+    must(r.ns.calls.accept === 1, "an offer over 80% of the expectation is accepted");
 
     // Round 5 (offer 4 taken / public): go public with 0 new shares, set the dividend once, never sell shares.
     // One state object for both runs: goPublic makes it public for the second one.
@@ -637,6 +808,67 @@ export async function selfCheck() {
     // --go-public false: the dividend is never issued on its own.
     r = await run(fakeState({ round: 5, offerFunds: 0 }), newMemory(), { ...CFG, goPublic: false });
     must(r.ns.calls.goPublic.length === 0, "go-public false stays private");
+
+    // ---- the post-public faction bribe (harsh-softcap nodes only) ----
+    const joined = ["CyberSec", "NiteSec"];
+    const publicCorp = (o = {}) => ({ public: true, funds: 1e12, revenue: 1e11, expenses: 0, valuation: 1e14, dividendRate: 0.5, ...o });
+    const harshCfg = { ...CFG, softcap: 0.4, bribeShare: 0.1 }; // 0.4 = BN13's CorporationSoftcap
+    must(!softcapIsHarsh(1) && !softcapIsHarsh(undefined), "BN3 (softcap 1) is not harsh");
+    must(softcapIsHarsh(0.9) && softcapIsHarsh(0.4) && softcapIsHarsh(0), "any softcap below 1 is harsh");
+    must(!bribePlan(publicCorp(), CFG, joined).online, "BN3 post-public does not bribe");
+    must(!bribePlan(publicCorp({ public: false }), harshCfg, joined).online, "pre-offer does not bribe");
+    must(!bribePlan(publicCorp({ valuation: 1e13 }), harshCfg, joined).online, "valuation under the game's threshold does not bribe");
+    must(!bribePlan(publicCorp(), { ...harshCfg, bribeShare: 0.5 }, joined).online, "share + dividend-rate 1.0 is refused");
+    same(
+        bribePlan(publicCorp(), harshCfg, joined).targets,
+        [{ faction: "CyberSec", amount: 5e10 }, { faction: "NiteSec", amount: 5e10 }],
+        "10% of a cycle's profit, split over the goal factions",
+    );
+    must(!bribePlan(publicCorp({ revenue: 1e9 }), harshCfg, joined).online, "a share under one reputation is not spent");
+    must(!bribePlan(publicCorp({ funds: 5e8 }), harshCfg, joined).online, "a share larger than the funds on hand is not spent");
+    must(!bribePlan(publicCorp(), harshCfg, []).online, "no goal faction = nothing to bribe");
+
+    // ---- bribe targets come from faction-manager's aug goals, not from every joined faction ----
+    const augGoals = (map) => JSON.stringify({ rep_needed_by_faction: map });
+    const harshState = (o = {}) => fakeState({
+        round: 5, offerFunds: 0, factions: ["CyberSec", "NiteSec", "Bladeburners"],
+        augGoals: augGoals({ CyberSec: 2e5, NiteSec: 3e5 }),
+        corp: { funds: 1e12, divisions: [TOB_NAME], public: true, revenue: 1e11, expenses: 0, valuation: 1e14, dividendRate: 0.5 },
+        ...o,
+    });
+    // Only the factions with a rep deficit are bribed: Bladeburners is joined but has no missing aug.
+    r = await run(harshState(), newMemory(), harshCfg);
+    same(
+        r.ns.calls.bribe,
+        [{ faction: "CyberSec", amount: 5e10 }, { faction: "NiteSec", amount: 5e10 }],
+        "the bribe share is split over faction-manager's goal factions",
+    );
+    must(r.ns.lines.some((l) => l.includes("MILESTONE") && l.includes("first faction bribe")), `bribe MILESTONE: ${r.ns.lines}`);
+    // A goal faction we are not in is skipped (a stale goal file from before a reset must not be spent on),
+    // and the cycle's whole share then goes to the faction that IS left - the share caps the TOTAL spend.
+    r = await run(harshState({ augGoals: augGoals({ CyberSec: 2e5, "The Syndicate": 5e5 }), factions: ["CyberSec", "NiteSec"] }), newMemory(), harshCfg);
+    same(r.ns.calls.bribe, [{ faction: "CyberSec", amount: 1e11 }], "a goal faction we are not in is skipped");
+    // No goal file yet (faction-manager has not run this reset, or just bought its order): spend nothing.
+    r = await run(harshState({ augGoals: "" }), newMemory(), harshCfg);
+    same(r.ns.calls.bribe, [], "no aug goals = no bribe");
+    must(r.ns.lines.some((l) => l.includes("no aug goals from faction-manager.js")), `the missing goal file is logged: ${r.ns.lines}`);
+    // --bribe-faction overrides the goal file (still restricted to factions we are in).
+    r = await run(harshState({ factions: ["CyberSec", "The Black Hand"] }), newMemory(), { ...harshCfg, bribeFactions: ["The Black Hand"] });
+    same(r.ns.calls.bribe, [{ faction: "The Black Hand", amount: 1e11 }], "--bribe-faction overrides the goals");
+    // The cycle it goes public: the dividend is issued, the bribe waits one cycle (getCorporation() is a copy
+    // taken before goPublic, so corp.public still reads false there).
+    r = await run(harshState({ corp: { funds: 1e12, divisions: [TOB_NAME], public: false, revenue: 1e11, expenses: 0, valuation: 1e14, dividendRate: 0.5 } }), newMemory(), harshCfg);
+    same(r.ns.calls.dividends, [0.5], "the dividend is still issued on the cycle it goes public");
+    same(r.ns.calls.bribe, [], "the bribe waits for the next cycle");
+    // BN3 (softcap 1) post-public: the dividend alone, never a bribe.
+    must(again.ns.calls.bribe.length === 0, "BN3 post-public never bribes");
+    // A refusal is remembered for the rest of the run instead of being asked every cycle.
+    const refusedState = () => harshState({ bribeRefuses: ["NiteSec"] });
+    r = await run(refusedState(), newMemory(), harshCfg);
+    must(r.ns.calls.bribe.length === 2, `both goal factions are asked once: ${r.ns.calls.bribe.length}`);
+    must(r.ns.lines.some((l) => l.includes("NiteSec refused a bribe")), `refusal WARN: ${r.ns.lines}`);
+    const refusedAgain = await run(refusedState(), r.mem, harshCfg);
+    same(refusedAgain.ns.calls.bribe, [{ faction: "CyberSec", amount: 1e11 }], "a refused faction is not asked again (the rest absorb its share)");
 
     return true;
 }

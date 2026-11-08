@@ -176,7 +176,6 @@ function pickJob(state, ctx, phase, opts, { divisions, round, funds, profit }) {
     const tobFinished = (tob?.products ?? []).some((p) => p.developmentProgress >= 100);
     const tobRevenue = (tob?.lastCycleRevenue ?? 0) > 0;
     const numDivisions = Object.keys(divisions).length;
-    const hasDummy = Object.keys(divisions).some((name) => name.startsWith("z-"));
     const plan = spendPlan(state, opts);
 
     const chemBudget = Math.min(profit * (round <= 4 ? 0.1 : 0.01), funds * 0.01);
@@ -199,7 +198,11 @@ function pickJob(state, ctx, phase, opts, { divisions, round, funds, profit }) {
             reason: `support division ${AGRI_NAME} (every ${SUPPORT_CADENCE[AGRI_NAME]} cycles)`,
         },
         {
-            due: due(R_DUMMIES) && tobFinished && numDivisions < MAX_DIVISIONS && !hasDummy && dummyBudget >= DUMMY_DIVISION_COST,
+            // §18.5: keep adding dummy divisions until the 20-division cap. This used to also require "no z-
+            // division exists yet", which capped the offer inflation at ONE dummy forever (each dummy adds 12
+            // to offices+warehouses, i.e. x1.1 to the offer - 1.46x at one dummy vs 6.7x at seventeen). The job
+            // is idempotent (it skips names it already created) and builds every affordable dummy in one run.
+            due: due(R_DUMMIES) && tobFinished && numDivisions < MAX_DIVISIONS && dummyBudget >= DUMMY_DIVISION_COST,
             script: R_DUMMIES,
             args: ["--budget", String(dummyBudget)],
             reason: "dummy divisions to inflate the round 3/4 offer (§18.5)",
@@ -341,6 +344,21 @@ export function selfCheck() {
     eq(decide(noTob, lowCtx()).job?.script, R_R3, "LOW round 4 runs the Tobacco setup");
     ok(!scripts(decide(withTob(4), lowCtx())).includes(R_PRODUCTS), "LOW round 4: no T13 before the offers are gone");
     ok(scripts(decide(withTob(5), lowCtx())).includes(R_PRODUCTS), "LOW round 5: T13 runs again");
+
+    // 9. §18.5 dummy divisions: the job must keep running until the division cap. It used to also require "no
+    //    z- division exists yet", which stopped it after the first dummy - in-game that left a round-4 corp at
+    //    4/20 divisions, i.e. an offer factor of 1.1^4 = 1.46x instead of the 1.1^20 = 6.73x the plan counts on.
+    const finishedTob = div({ products: [{ name: `${TOB_NAME}-00000-1.00000e+9`, developmentProgress: 100 }] });
+    const withDummy = fakeState({
+        divisions: { [AGRI_NAME]: div(), [CHEM_NAME]: div(), [TOB_NAME]: finishedTob, "z-00": div({ industry: "Restaurant" }) },
+        offer: { round: 3 },
+    });
+    eq(decide(withDummy, fakeCtx({ installed: new Set([R_DUMMIES]) })).job?.script, R_DUMMIES, "a z- division does not stop the dummy job");
+    const atCap = {};
+    for (let i = 0; i < 20; i++) atCap[`z-${String(i).padStart(2, "0")}`] = div({ industry: "Restaurant" });
+    atCap[TOB_NAME] = finishedTob;
+    const capJob = decide(fakeState({ divisions: atCap, offer: { round: 3 } }), fakeCtx({ installed: new Set([R_DUMMIES, R_ADVERT]) })).job;
+    ok(capJob?.script !== R_DUMMIES, `no dummy job at the 20-division cap (got ${capJob?.script})`);
 
     return true;
 }

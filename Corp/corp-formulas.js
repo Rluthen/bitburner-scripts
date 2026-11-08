@@ -207,21 +207,23 @@ export function ratiosToCounts(ratios, size) {
   return counts;
 }
 
-/** Product id out of a generated name ("Ebon Stick-00002-3.00000e+9" -> 2); NaN when there is none. **/
+/** Product id out of a generated name: "Ebon Stick-16" (current scheme) or the older
+ * "Ebon Stick-00016-1.00000e+9" written before 2026-11-08 - the products already in the game still number
+ * themselves with it. NaN when the name carries no id. **/
 export function parseProductId(name) {
-  const match = /-(\d{5})-/.exec(name);
+  const match = /-(\d{5})-/.exec(name) ?? /-(\d+)$/.exec(name);
   return match === null ? NaN : parseInt(match[1], 10);
 }
 
-/** Name for the next product of a division. Throws on a budget the game would not accept. **/
-export function nextProductName(existingNames, divisionName, budget) {
-  if (!Number.isFinite(budget) || budget < 1e3) throw new Error(`invalid product budget: ${budget}`);
+/** Name for the next product of a division: "<division>-<n>". The number continues past every product the
+ * division already has, whatever scheme named it, so a generated name can never collide with an existing one. **/
+export function nextProductName(existingNames, divisionName) {
   let maxId = -1;
   for (const name of existingNames) {
     const id = parseProductId(name);
     if (Number.isFinite(id) && id > maxId) maxId = id;
   }
-  return `${divisionName}-${String(maxId + 1).padStart(5, "0")}-${budget.toExponential(5)}`;
+  return `${divisionName}-${maxId + 1}`;
 }
 
 /** How many products the phase may still create, by investment round (maxNumberOfProductsInRound3/4). **/
@@ -334,17 +336,14 @@ export function selfCheck() {
     if (sum !== size) throw new Error(`ratiosToCounts does not sum to ${size}: ${sum}`);
   }
 
-  if (nextProductName([], "Ebon Stick", 1e9) !== "Ebon Stick-00000-1.00000e+9") throw new Error("nextProductName first");
-  const existing = ["Ebon Stick-00000-1.00000e+9", "Ebon Stick-00001-1.94725e+9"];
-  if (nextProductName(existing, "Ebon Stick", 3e9) !== "Ebon Stick-00002-3.00000e+9") throw new Error("nextProductName next");
+  if (nextProductName([], "Ebon Stick") !== "Ebon Stick-0") throw new Error("nextProductName first");
+  const existing = ["Ebon Stick-0", "Ebon Stick-1"];
+  if (nextProductName(existing, "Ebon Stick") !== "Ebon Stick-2") throw new Error("nextProductName next");
+  // Both name schemes number the same way, so the products already in the game keep the sequence going. The
+  // legacy pattern must win: the budget's "e+23" also ends in digits and would otherwise read as id 23.
+  if (parseProductId("Ebon Stick-16") !== 16 || parseProductId("Ebon Stick-00015-4.60069e+23") !== 15)
+    throw new Error("parseProductId reads both schemes");
   if (parseProductId("BIG CIG") === parseProductId("BIG CIG")) throw new Error("parseProductId should be NaN");
-  let threw = false;
-  try {
-    nextProductName([], "x", 500);
-  } catch {
-    threw = true;
-  }
-  if (!threw) throw new Error("nextProductName should reject a budget under 1e3");
   if (allowedProductCeiling(3) !== 1 || allowedProductCeiling(4) !== 2 || allowedProductCeiling(5) !== Infinity) throw new Error("allowedProductCeiling");
 
   near(optimalSellingPrice({ markupLimit: 100, marketPrice: 1000, potentialSalesVolume: 1e6, stored: 1e4 }), 1000 + (100 * Math.sqrt(1e6)) / Math.sqrt(1e3), 1e-5, "optimalSellingPrice");
