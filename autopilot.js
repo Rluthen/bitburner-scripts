@@ -79,12 +79,16 @@ export function reservedHomeRam({ stanekRunning, sf4, corpRunning }) {
 
 /** Pure: does the live daemon.js need a restart to pick up `reservedRam`? daemon.js's own relaunch
  *  heuristic ignores NUMERIC args, so a changed --reserved-ram would otherwise never take effect.
+ *  `reservedRam === 0` means "pass NO flag" (daemon.js's own default applies, 32 or 64 by home size),
+ *  so the only relaunch it can justify is taking an existing flag AWAY - comparing it against daemon's
+ *  32 default made every check relaunch daemon.js with byte-identical args (BN9 loop, 2026-11-08).
  *  @param {string[]|undefined} runningArgs the live daemon.js's args (undefined = it is not running)
  *  @param {number} reservedRam the value we want it to run with @returns {boolean} **/
 export function daemonRamReserveChanged(runningArgs, reservedRam) {
     if (!runningArgs) return false; // not running: the `!existingDaemon` path starts it with the new args
     const i = runningArgs.indexOf("--reserved-ram");
-    const running = i >= 0 ? Number(runningArgs[i + 1]) : 32; // absent = daemon.js's schema default
+    const running = i >= 0 ? Number(runningArgs[i + 1]) : null; // null = no flag, i.e. daemon.js's own default
+    if (reservedRam === 0) return running !== null; // we want no flag: relaunch only to remove one
     return running !== reservedRam;
 }
 
@@ -125,6 +129,10 @@ export function selfCheck() {
     eq(daemonRamReserveChanged(["--reserved-ram", CORP_HOME_RESERVE], CORP_HOME_RESERVE), false, "reserve: already correct - must not relaunch every check");
     eq(daemonRamReserveChanged(["--reserved-ram", 1e100], CORP_HOME_RESERVE), true, "reserve: stanek ended - hand RAM back");
     eq(daemonRamReserveChanged(["--cycle-timing-delay", 40, "--silent-misfires"], CORP_HOME_RESERVE), true, "reserve: a flag list is not a reserve");
+    // reservedRam === 0 means we push NO --reserved-ram: that must be the steady state, not a Relaunch-every-check.
+    eq(daemonRamReserveChanged(["--disable-script", "work-for-factions.js"], 0), false, "reserve 0: no flag wanted, none running - never relaunch");
+    eq(daemonRamReserveChanged(["--reserved-ram", 1e100], 0), true, "reserve 0: stanek ended - hand RAM back");
+    eq(daemonRamReserveChanged(["--reserved-ram", CORP_HOME_RESERVE], 0), true, "reserve 0: corporation closed - hand RAM back");
     return true;
 }
 
