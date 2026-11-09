@@ -13,7 +13,7 @@
  * Shape of the JSON produced (T06/T07 depend on these exact keys - do NOT rename):
  *   { "t":1730000000000, "hasCorp":true,
  *     "corp":{"name":"Erebos","funds":5e9,"revenue":1e6,"expenses":2e5,"profit":8e5,"public":false,
- *             "valuation":1e12,"sharePrice":0,"dividendRate":0,"numShares":0,"totalShares":0,
+ *             "valuation":1e12,"sharePrice":0,"dividendRate":0,"dividendEarnings":0,"numShares":0,"totalShares":0,
  *             "prevState":"SALE","nextState":"START","divisions":["Dark Soil"]},
  *     "offer":{"funds":5.5e11,"round":1,"shares":0},
  *     "unlocks":{...} , "upgrades":{...} ,
@@ -123,6 +123,7 @@ export function buildSnapshot(ns) {
             valuation: corp.valuation,
             sharePrice: corp.sharePrice,
             dividendRate: corp.dividendRate,
+            dividendEarnings: corp.dividendEarnings, // per second, 0 until the corporation issues a dividend
             numShares: corp.numShares,
             totalShares: corp.totalShares,
             prevState: corp.prevState,
@@ -173,8 +174,8 @@ function mockNs() {
         corporation: {
             hasCorporation: () => true,
             getCorporation: () => ({
-                name: "Erebos", funds: 5e9, revenue: 1e6, expenses: 2e5, public: false, valuation: 1e12,
-                sharePrice: 0, dividendRate: 0, numShares: 0, totalShares: 0,
+                name: "Erebos", funds: 5e9, revenue: 1e6, expenses: 2e5, public: true, valuation: 1e12,
+                sharePrice: 0, dividendRate: 0.1, numShares: 1e9, totalShares: 1e9, dividendEarnings: 1.5e6,
                 prevState: "SALE", nextState: "START", divisions: ["Dark Soil"],
             }),
             getInvestmentOffer: () => ({ funds: 5.5e11, round: 1, shares: 0 }),
@@ -219,6 +220,7 @@ export async function selfCheck() {
     const snap = buildSnapshot(ns);
     must(snap.hasCorp === true && snap.corp.profit === 8e5, `profit ${snap.corp.profit}`);
     must(snap.offer.round === 1 && snap.offer.funds === 5.5e11, `offer ${JSON.stringify(snap.offer)}`);
+    must(snap.corp.dividendEarnings === 1.5e6, `dividendEarnings ${snap.corp.dividendEarnings}`);
     must(Object.keys(snap.unlocks).length === 6 && snap.unlocks.Export === true && snap.unlocks["Smart Supply"] === false, "unlocks");
     must(Object.keys(snap.upgrades).length === 9 && snap.upgrades["Smart Storage"] === 25, "upgrades");
     const div = snap.divisions["Dark Soil"];

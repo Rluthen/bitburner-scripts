@@ -194,7 +194,7 @@ async function getHudData(ns, bitNode, dictSourceFiles, options) {
         hudData.push(val)
     }
 
-    // Show the corporation (funds / profit / offer). The corp.js daemon prints this same healthcheck only
+    // Show the corporation (funds / profit / offer / dividends). The corp.js daemon prints this same healthcheck only
     // once a minute, so the live readout lives here. 0 GB: reads T04's snapshot file, not ns.corporation.
     {
         let snap = null;
@@ -383,9 +383,9 @@ const CORP_HUD_STALE_MS = 30_000; // snapshot older than this = the corporation 
 /** Corporation HUD rows built from T04's snapshot (/Temp/corp-state.txt, ns.read = 0 GB).
  *  Pure: selfCheck() pins the hidden / stale / live branches.
  *  @param {object|null} snap parsed STATE_FILE @param {number} nowMs
- *  @returns {HudRowConfig[]} the three rows, in display order **/
+ *  @returns {HudRowConfig[]} the four rows, in display order **/
 export function corpHudRows(snap, nowMs = Date.now()) {
-    const rows = [["Corp Funds"], ["Corp Profit"], ["Corp Offer"]];
+    const rows = [["Corp Funds"], ["Corp Profit"], ["Corp Offer"], ["Corp Div"]];
     const live = snap?.hasCorp === true && !snap.error && typeof snap.t === 'number' && nowMs - snap.t <= CORP_HUD_STALE_MS;
     if (!live) {
         for (const row of rows) row.push(false); // hidden, but present: prepareHudElements() only builds rows it sees on the first tick
@@ -396,9 +396,17 @@ export function corpHudRows(snap, nowMs = Date.now()) {
     const source = `Corporation "${c.name}", read from ${STATE_FILE} (Corp/corp-snapshot.js refreshes it once per corporation cycle, ~10 s).`;
     rows[0].push(true, formatMoney(c.funds ?? 0), `Corporation funds.\n${source}`);
     rows[1].push(true, formatMoney(profit) + '/s', `Corporation revenue minus expenses per second - the number the corp.js log calls "profit".\n${source}`);
-    const o = snap.offer ?? {};
-    rows[2].push(true, o.funds > 0 ? `r${o.round} ${formatMoney(o.funds)}` : 'no offer',
+    // funds 0 = no offer left to accept (round 4 taken / corporation public). The row is HIDDEN rather than
+    // printing "no offer", which is otherwise a dead line for the rest of the BitNode.
+    const o = snap.offer ?? {}, hasOffer = o.funds > 0;
+    rows[2].push(hasOffer, hasOffer ? `r${o.round} ${formatMoney(o.funds)}` : null,
         `Investment offer currently on the table (round ${o.round ?? '-'}, ${formatMoney(o.funds ?? 0)}).\n${source}`);
+    // What the corporation pays the player: the game's own CorporationInfo.dividendEarnings, per second. 0 (or
+    // absent, on a game version without the field) until the corporation is public and issues a dividend.
+    const div = c.dividendEarnings ?? 0;
+    rows[3].push(div > 0, formatMoney(div) + '/s',
+        `Dividends the corporation pays you, per second: the game's dividendEarnings = dividendRate x the last ` +
+        `cycle's profit x your share of the shares, after dividend tax. Paid as one lump per market cycle (~10 s).\n${source}`);
     return rows;
 }
 
@@ -414,16 +422,22 @@ export function selfCheck() {
         throw new Error('corpHudRows: a stale snapshot must hide every row');
     if (corpHudRows({ t: now, hasCorp: true, error: 'boom' }, now).some((r) => r[1] !== false))
         throw new Error('corpHudRows: a failed snapshot must hide every row');
-    const snap = { t: now, hasCorp: true, corp: { name: 'Erebos', funds: 12.676e9, revenue: 2e7, expenses: 2.6e6 }, offer: { funds: 4.647e12, round: 2 } };
+    const snap = { t: now, hasCorp: true, corp: { name: 'Erebos', funds: 12.676e9, revenue: 2e7, expenses: 2.6e6, dividendEarnings: 1.74e6 }, offer: { funds: 4.647e12, round: 2 } };
     const rows = corpHudRows(snap, now);
-    if (rows.length !== 3 || rows.some((r) => r[1] !== true)) throw new Error(`corpHudRows: a live snapshot shows 3 rows, got ${JSON.stringify(rows)}`);
+    if (rows.length !== 4 || rows.some((r) => r[1] !== true)) throw new Error(`corpHudRows: a live snapshot shows 4 rows, got ${JSON.stringify(rows)}`);
     if (rows[0][2] !== formatMoney(12.676e9)) throw new Error(`funds row: ${rows[0][2]}`);
     if (rows[1][2] !== formatMoney(17.4e6) + '/s') throw new Error(`profit row: ${rows[1][2]}`);
     if (rows[2][2] !== `r2 ${formatMoney(4.647e12)}`) throw new Error(`offer row: ${rows[2][2]}`);
-    const offline = corpHudRows({ t: now, hasCorp: true, corp: { funds: 0 }, offer: { funds: 0, round: 3 } }, now);
-    if (offline[2][2] !== 'no offer') throw new Error(`no-offer row: ${offline[2][2]}`);
+    if (rows[3][2] !== formatMoney(1.74e6) + '/s') throw new Error(`dividend row: ${rows[3][2]}`);
+    // Last offer accepted (funds 0 = no offer left / corporation public): the offer ROW hides, it never prints "no offer"
+    const post = corpHudRows({ t: now, hasCorp: true, corp: { name: 'Erebos', funds: 1e9, dividendEarnings: 1.74e6 }, offer: { funds: 0, round: 4 } }, now);
+    if (post[2][1] !== false) throw new Error(`the offer row must hide once there is no offer: ${JSON.stringify(post[2])}`);
+    if (post[3][1] !== true || post[3][2] !== formatMoney(1.74e6) + '/s') throw new Error(`dividend row post-offer: ${JSON.stringify(post[3])}`);
+    // Nothing is being paid out yet (private corporation / dividendRate 0): the dividend row hides as well
+    if (corpHudRows({ t: now, hasCorp: true, corp: { funds: 1e9 }, offer: { funds: 5e11, round: 2 } }, now)[3][1] !== false)
+        throw new Error('the dividend row must hide while the corporation pays no dividend');
     // Ids must be unique: updateHudElement() looks rows up by id (a duplicate silently writes the wrong row).
-    if (new Set(ids(rows)).size !== 3) throw new Error(`duplicate HUD ids: ${ids(rows).join(',')}`);
+    if (new Set(ids(rows)).size !== 4) throw new Error(`duplicate HUD ids: ${ids(rows).join(',')}`);
     if (ids(rows).some((id) => ['Reserve', 'Stock', 'Hashes', 'BitNode'].includes(id)))
         throw new Error(`HUD id collides with an existing row: ${ids(rows).join(',')}`);
     return true;
