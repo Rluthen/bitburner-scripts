@@ -219,6 +219,16 @@ export async function main(ns) {
         if (!runOptions || await instanceCount(ns) > 1) return; // Prevent multiple instances of this script from being started, even with different args.
         options = runOptions; // We don't set the global "options" until we're sure this is the only running instance
 
+        // The game logs EVERY non-"Success" corporation.canCreateCorporation result into OUR tail: the NS wrapper
+        // (src/NetscriptFunctions/Corporation.ts:621-628) calls helpers.log -> workerScript.log(functionPath, message)
+        // unless the result is "Success", and that prefix is what the tail line shows. On any BitNode other than 3 the
+        // seed check can never be "Success" (src/Corporation/helpers.ts:37-39 -> UseSeedMoneyOutsideBN3 ->
+        // "You cannot use seed money outside BitNode 3"), so maybeStartCorporation()'s per-check poll at line 621
+        // printed it once per --interval-check-scripts, forever. Silence the API's narration, not the check:
+        // canSeed/canSelfFund still drive corporationPlan() unchanged. Called ONCE, here, because disableLog()
+        // re-prints "Disabled logging for ..." on every call (src/NetscriptFunctions.ts:476-490).
+        ns.disableLog("corporation.canCreateCorporation"); // 0 GB
+
         log(ns, "INFO: Auto-pilot engaged...", true, 'info');
         // The game does not allow boolean flags to be turned "off" via command line, only on. Since this gets saved, notify the user about how they can turn it off.
         const flagsSet = ['disable-auto-destroy-bn', 'disable-bladeburner', 'disable-wait-for-4s', 'disable-rush-gangs'].filter(f => options[f]);
