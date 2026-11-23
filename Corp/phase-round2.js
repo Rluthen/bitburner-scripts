@@ -206,11 +206,19 @@ async function run(ns, cfg) {
     // let the corporation earn it. Keeping Agriculture on production jobs while waiting is what makes that
     // possible - production is Ops/Eng/Mgmt (§9.1.1), so an office left on nothing but R&D earns nothing and
     // the round would never become affordable (the offer, §17.3, is driven by that same AssetDelta).
-    if (!ensureDivision(ns, CHEM_INDUSTRY, CHEM_NAME, cities, CHEM_OFFICE_SIZE, CHEM_WAREHOUSE_LEVEL)) {
-        assignProductionJobs(ns, AGRI_NAME, cities, JOBS_WHILE_WAITING);
+    // The DIVISION money is still waited for by returning (the next run continues where this stopped), but the
+    // office money is waited for inside ensureDivision: it parks on nextUpdate until every city has an office,
+    // so this round can never leave Chemical half-expanded (see the comment above that function).
+    // AGRI goes back on PRODUCTION before anything else here: buying Chemical costs ~490e9 and the wait is paid
+    // out of Agriculture's income. Leaving whatever mix was there was the bug - a run that died at the export
+    // below had ALREADY put AGRI on 100% R&D (the setAllOnRnd calls just after this), so the corporation earned
+    // nothing, only paid salaries (~-40k/s), and the warehouses it was waiting for never became affordable.
+    // assignProductionJobs only touches the production jobs, so R&D: 0 is explicit in JOBS_WHILE_WAITING.
+    assignProductionJobs(ns, AGRI_NAME, cities, JOBS_WHILE_WAITING);
+    if (!(await ensureDivision(ns, CHEM_INDUSTRY, CHEM_NAME, cities, CHEM_OFFICE_SIZE, CHEM_WAREHOUSE_LEVEL))) {
         corpLog(
             ns,
-            `${CHEM_NAME}: not affordable yet (${formatMoney(chemIndustry.startingCost)} for the division + 5 offices/warehouses, ${formatMoney(ns.corporation.getCorporation().funds)} in hand) - waiting, ${AGRI_NAME} kept producing`,
+            `${CHEM_NAME}: division not created yet (${formatMoney(chemIndustry.startingCost)}, ${formatMoney(ns.corporation.getCorporation().funds)} in hand) - waiting, ${AGRI_NAME} kept producing`,
             "WARN",
         );
         return;

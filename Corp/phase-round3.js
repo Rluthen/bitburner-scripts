@@ -195,9 +195,10 @@ async function run(ns, cfg) {
         return;
     }
 
-    // Step 3: Tobacco in every city (office 3, warehouse 1), all employees on R&D until the first product.
-    if (!ensureDivision(ns, TOB_INDUSTRY, TOB_NAME, cities, TOB_OFFICE_SIZE, TOB_WAREHOUSE_LEVEL)) {
-        corpLog(ns, `${TOB_NAME}: could not be set up - not enough funds?`, "ERROR");
+    // Step 3: Tobacco in every city (office 3, warehouse 1), all employees on R&D until the first product. The
+    // office money is waited for inside ensureDivision, so a shortfall cannot leave Tobacco half-expanded.
+    if (!(await ensureDivision(ns, TOB_INDUSTRY, TOB_NAME, cities, TOB_OFFICE_SIZE, TOB_WAREHOUSE_LEVEL))) {
+        corpLog(ns, `${TOB_NAME}: the division could not be created - see the reason above`, "ERROR");
         return;
     }
     setAllOnRnd(ns, TOB_NAME, cities);

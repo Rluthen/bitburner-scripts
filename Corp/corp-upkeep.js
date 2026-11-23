@@ -17,7 +17,7 @@
  * corporationUtils.ts buyTeaAndThrowParty (epsilon 0.5, party 500000, loop on nextUpdate).
  */
 import { getConfiguration } from "../helpers.js";
-import { alreadyRunning, corpLog, getCities, STATE_FILE } from "./corp-lib.js";
+import { alreadyRunning, corpLog, STATE_FILE } from "./corp-lib.js";
 
 const PARTY_COST = 500e3; // per employee, per party (§10.3); same for tea (game Constants teaCostPerEmployee)
 const TEA_COST = 500e3;
@@ -61,8 +61,11 @@ export async function main(ns) {
         cycles++;
         const divisions = divisionsFrom(ns.read(STATE_FILE));
         if (!divisions) continue; // no snapshot yet: skip this cycle rather than pay 10 GB for getCorporation
-        const cities = getCities(ns);
-        for (const division of divisions) {
+        // Per-division city list from the snapshot, never ns.enums.CityName: a division that is still expanding
+        // (round 2's Chemical buys one 4e9 office per cycle until it is in all 6 cities) has a shorter list, and
+        // getOffice THROWS ("Black Salt has not expanded to 'Ishima'") for a city its division is not in - which
+        // would kill this service instead of skipping one city.
+        for (const [division, cities] of divisions) {
             for (const city of cities) {
                 const office = ns.corporation.getOffice(division, city);
                 if (needsTea(office.avgEnergy, office.maxEnergy, eps)) {
@@ -86,11 +89,15 @@ export async function main(ns) {
     }
 }
 
-/** Division names from the T04 snapshot, or null when it is missing / unreadable / corp-less. **/
+/** [division, cities] pairs from the T04 snapshot, or null when it is missing / unreadable / corp-less. `cities`
+ * is the list the division is ACTUALLY in (the snapshot's own division slices): while a round is still buying
+ * the 4e9 offices, a division is in fewer than 6 cities, and this is what keeps the office loop below from
+ * asking the game for an office that does not exist yet. **/
 function divisionsFrom(text) {
     try {
         const snap = JSON.parse(text);
-        return snap && snap.hasCorp && Array.isArray(snap.corp?.divisions) ? snap.corp.divisions : null;
+        if (!snap || !snap.hasCorp || !Array.isArray(snap.corp?.divisions) || !snap.divisions) return null;
+        return snap.corp.divisions.map((name) => [name, snap.divisions[name]?.cities ?? []]);
     } catch {
         return null;
     }
@@ -108,7 +115,13 @@ export function selfCheck() {
     must(needsTea(109.4, 110, 0.5) === true, "(109.4,110,0.5) -> true (Go-Juice)");
     must(needsParty(99.4, 100, 0.5) === true && needsParty(99.6, 100, 0.5) === false, "party mirrors tea");
     must(needsTea(99.6, 100, 0.3) === true && needsTea(99.6, 100, 0.5) === false, "epsilon is honoured");
-    must(divisionsFrom('{"hasCorp":true,"corp":{"divisions":["Dark Soil"]}}')?.length === 1, "divisions from snapshot");
+    const snap = '{"hasCorp":true,"corp":{"divisions":["Dark Soil","Black Salt"]},"divisions":{"Dark Soil":{"cities":["Aevum","Ishima"]},"Black Salt":{"cities":["Aevum"]}}}';
+    must(
+        JSON.stringify(divisionsFrom(snap)) === '[["Dark Soil",["Aevum","Ishima"]],["Black Salt",["Aevum"]]]',
+        "division cities from snapshot (half-expanded division keeps its short list)",
+    );
+    must(divisionsFrom('{"hasCorp":true,"corp":{"divisions":["Dark Soil"]},"divisions":{"Dark Soil":{}}}')[0][1].length === 0, "division slice without cities -> empty list");
     must(divisionsFrom("") === null && divisionsFrom("{}") === null, "missing/corrupt snapshot -> null");
+    must(divisionsFrom('{"hasCorp":true,"corp":{"divisions":["Dark Soil"]}}') === null, "names without division slices -> null");
     return true;
 }

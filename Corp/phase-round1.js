@@ -192,9 +192,11 @@ async function run(ns, cfg) {
     const cities = getCities(ns);
     if (!ensureCorporation(ns, cfg)) return;
 
-    // Step 2: Agriculture in all 6 cities with a warehouse and 3 employees each (T03, idempotent).
-    if (!ensureDivision(ns, INDUSTRY, AGRI_NAME, cities, 3, 1)) {
-        corpLog(ns, `${AGRI_NAME}: could not be set up - not enough funds?`, "ERROR");
+    // Step 2: Agriculture in all 6 cities with a warehouse and 3 employees each (T03, idempotent). The office
+    // money is waited for inside ensureDivision (an office bought short leaves the division half-expanded,
+    // which breaks every per-city reader); only a refused creation (division cap, funds) gets here.
+    if (!(await ensureDivision(ns, INDUSTRY, AGRI_NAME, cities, 3, 1))) {
+        corpLog(ns, `${AGRI_NAME}: the division could not be created - see the reason above`, "ERROR");
         return;
     }
     const industry = ns.corporation.getIndustryData(INDUSTRY); // factors + materials at runtime (CONTEXT §4b)

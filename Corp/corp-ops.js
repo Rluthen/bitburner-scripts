@@ -1,7 +1,8 @@
 /** Shared, idempotent corporation actions for the Corp/ workers (T03).
  * Every function reads the current level/size first and buys only the delta, so re-running after a crash
  * never double-spends. Nothing here throws on "cannot afford": the unaffordable purchase is skipped and the
- * shortfall is logged.
+ * shortfall is logged - except ensureDivision, which WAITS for the office money instead of leaving the
+ * division half-expanded (a division that is missing a city breaks every per-city reader in the game).
  *
  * Distinct ns.corporation.* APIs referenced by this file (RAM is per distinct name, summed for every script
  * that imports it - see CONTEXT §4 for the docs figures):
@@ -15,7 +16,7 @@
  * upgradeWarehouse, upgradeOffices/assignJobs, stockMaterials, waitUntilHavingEnoughResearchPoints,
  * createDivision, waitForOffer). Guide refs: §1.1 (clear per-second purchases), §4.1 (R&D first), §19.1.
  */
-import { corpLog, getCities, BOOST_MATERIALS, JOBS, EXPORT_STRING } from "./corp-lib.js";
+import { corpLog, BOOST_MATERIALS, JOBS, EXPORT_STRING } from "./corp-lib.js";
 import { maxAffordableOfficeSize, maxAffordableWarehouseLevel } from "./corp-formulas.js";
 
 // corpConstants (stable/src/Corporation/data/Constants.ts): warehouseInitialCost / officeInitialCost / teaCostPerEmployee
@@ -150,10 +151,38 @@ export function ensureOfficeSize(ns, division, city, targetSize, budgetCap = Inf
     return { size: office.size, spent };
 }
 
+/** Park on nextUpdate() (0 GB, in the header's API list) until the corporation can pay `cost` for `what`.
+ * Needed because the round's own setup THROWS or silently no-ops when a city is not fully built:
+ * expandCity/purchaseOffice ("You don't have enough company funds to open a new office!"), exportMaterial
+ * ("Cannot export to Aevum in division Black Salt because there is no warehouse"), and purchaseWarehouse -
+ * which does NOT throw, it just does nothing, leaving a city with an office and no warehouse (game source).
+ * Logs the first cycle and then every 10th, so a long wait is visible without spamming the log port - with the
+ * corporation's profit in it, because a wait can only end if something is earning (a round that parks while its
+ * only revenue division sits on R&D never finishes).
+ * AWAITED: waiting through anything else would be a second ns context and kill the script. **/
+async function waitForFunds(ns, division, cost, what) {
+    let cycles = 0;
+    while (cost > funds(ns)) {
+        if (++cycles % 10 === 1) {
+            const corp = ns.corporation.getCorporation();
+            corpLog(ns, `${division}: ${money(funds(ns))} in hand, profit ${money(corp.revenue - corp.expenses)}/s, waiting for ${money(cost)} for ${what}`, "WARN");
+        }
+        await ns.corporation.nextUpdate();
+    }
+}
+
 /** Make a division exist in every listed city with a warehouse, employees and an office of officeSize.
- * expandIndustry/expandCity/expandWarehouse THROW on insufficient funds (game source), so they are caught here
- * and reported instead of killing the worker. @returns {boolean} **/
-export function ensureDivision(ns, industry, name, cities, officeSize = 3, warehouseLevel = 1) {
+ * expandIndustry THROWS when the corporation cannot afford the division or is at its division cap, so that is
+ * caught and reported. A missing CITY is never caught, though - it is waited for: both the office (4e9, and
+ * expandCity THROWS short) and the warehouse (5e9, and purchaseWarehouse silently does nothing short, while
+ * every export/sell/smart-supply call in the round THROWS without it). Returning early used to leave the
+ * division half-built, which is a broken state for everything else: every per-city reader
+ * (getOffice/getWarehouse/getMaterial) THROWS for the missing city - "Black Salt has not expanded to
+ * 'Ishima'" - and the round died mid-setup on the first export. So this returns true only once EVERY listed
+ * city has an office AND a warehouse. AWAITED and single-context: it must not be called while another ns call
+ * is pending. @returns {Promise<boolean>} false only for a failure waiting cannot fix (division cap, refused
+ * creation) **/
+export async function ensureDivision(ns, industry, name, cities, officeSize = 3, warehouseLevel = 1) {
     if (!ns.corporation.getCorporation().divisions.includes(name)) {
         try {
             ns.corporation.expandIndustry(industry, name);
@@ -164,15 +193,18 @@ export function ensureDivision(ns, industry, name, cities, officeSize = 3, wareh
         }
     }
     const division = ns.corporation.getDivision(name);
+    // Counted locally, not read back from `division.cities`: whether the game hands out the live division or a
+    // copy is not something a caller should depend on.
+    let inCities = division.cities.length;
     for (const city of cities) {
         if (!division.cities.includes(city)) {
-            if (OFFICE_INITIAL_COST > funds(ns)) {
-                corpLog(ns, `cannot expand "${name}" into ${city}: needs ${money(OFFICE_INITIAL_COST)}`, "WARN");
-                return false;
-            }
-            ns.corporation.expandCity(name, city); // THROWS when unaffordable - checked just above
-            corpLog(ns, `${name}: expanded into ${city}`);
+            await waitForFunds(ns, name, OFFICE_INITIAL_COST, `the ${city} office (${inCities}/${cities.length} cities done)`);
+            ns.corporation.expandCity(name, city); // THROWS when unaffordable - the wait above just checked
+            corpLog(ns, `${name}: expanded into ${city} (${++inCities}/${cities.length} cities)`);
         }
+        // The warehouse is not optional: exportMaterial/setSmartSupply/sellMaterial all need it, and
+        // purchaseWarehouse refuses silently rather than throwing, so the caller has to check for itself.
+        if (!ns.corporation.hasWarehouse(name, city)) await waitForFunds(ns, name, WAREHOUSE_INITIAL_COST, `the ${city} warehouse`);
         ensureWarehouse(ns, name, city, warehouseLevel);
         ensureOfficeSize(ns, name, city, officeSize);
     }
@@ -207,10 +239,20 @@ export function assignJobs(ns, division, city, jobs) {
     return ok;
 }
 
-/** assignJobs for every city. @returns {boolean} **/
+/** The cities a division is really in. getOffice/getWarehouse/getMaterial THROW for a city the division has
+ * not expanded into ("Black Salt has not expanded to 'Ishima'"), and a division spends several cycles
+ * half-expanded while ensureDivision below waits for each office's 4e9 (a division is created with Sector-12
+ * only), so a per-city loop must use this, never getCities(ns). Free here: this file already pays the 10 GB
+ * getDivision for ensureDivision.
+ * @param {NS} ns @param {string} division @returns {string[]} **/
+export function divisionCities(ns, division) {
+    return ns.corporation.getDivision(division).cities;
+}
+
+/** assignJobs for every city the division is in. @returns {boolean} **/
 export function assignJobsAllCities(ns, division, jobs) {
     let ok = true;
-    for (const city of getCities(ns)) if (!assignJobs(ns, division, city, jobs)) ok = false;
+    for (const city of divisionCities(ns, division)) if (!assignJobs(ns, division, city, jobs)) ok = false;
     return ok;
 }
 
@@ -336,7 +378,7 @@ export function acceptOffer(ns, expectedFunds, minFraction = 0.8) {
  * 0.5 of its max energy and morale BEFORE anything was bought **/
 export function teaAndPartyOnce(ns, division) {
     let allHappy = true;
-    for (const city of getCities(ns)) {
+    for (const city of divisionCities(ns, division)) {
         const office = ns.corporation.getOffice(division, city);
         if (office.avgEnergy < office.maxEnergy - HAPPY_EPSILON) {
             ns.corporation.buyTea(division, city);
@@ -369,6 +411,11 @@ export async function waitForHappy(ns, divisions, maxCycles = 30) {
 function mockNs() {
     const s = {
         funds: 100e9,
+        revenue: 0,
+        expenses: 0, // per cycle, as the game reports them; the wait log prints revenue - expenses
+        // Division -> the cities it is ACTUALLY in. A division is created with Sector-12 (Division.ts
+        // constructor), the other five cities cost 4e9 each (purchaseOffice -> officeInitialCost).
+        divisions: { "Dark Soil": ["Sector-12"] },
         upgrade: { level: 0, cost: (level) => [10e9, 20e9, 40e9][level] ?? Infinity },
         advert: { level: 0, cost: (level) => [1e9, 2.06e9][level] ?? Infinity },
         office: {
@@ -377,7 +424,9 @@ function mockNs() {
             employeeJobs: { Operations: 0, Engineer: 0, Business: 0, Management: 0, "Research & Development": 3, Intern: 0, Unassigned: 0 },
             nextJobs: { Operations: 0, Engineer: 0, Business: 0, Management: 0, "Research & Development": 3, Intern: 0, Unassigned: 0 },
         },
-        warehouse: null,
+        // Warehouses per city: purchaseWarehouse silently REFUSES when the funds are short (game source), so a
+        // city can end up with an office and no warehouse - the state that killed round 2's first export.
+        warehouses: {},
         stored: { "AI Cores": 0, Hardware: 0, "Real Estate": 0, Robots: 0 },
         buyOrders: { "AI Cores": 0, Hardware: 0, "Real Estate": 0, Robots: 0 },
         hired: 0,
@@ -390,7 +439,15 @@ function mockNs() {
         getPortHandle: () => ({ write: (line) => s.logs.push(line) }),
         corporation: {
             __state: s,
-            getCorporation: () => ({ funds: s.funds, divisions: ["Dark Soil"] }),
+            getCorporation: () => ({ funds: s.funds, divisions: Object.keys(s.divisions), revenue: s.revenue, expenses: s.expenses }),
+            getDivision: (name) => ({ name, cities: s.divisions[name] ?? [] }),
+            expandCity: (name, city) => {
+                // purchaseOffice (game source): THROWS when the corporation cannot pay the whole 4e9 at once.
+                if (s.funds < OFFICE_INITIAL_COST) throw new Error("You don't have enough company funds to open a new office!");
+                if (s.divisions[name].includes(city)) throw new Error(`You have already expanded into ${city} for ${name}`);
+                s.funds -= OFFICE_INITIAL_COST;
+                s.divisions[name].push(city);
+            },
             getUpgradeLevel: () => s.upgrade.level,
             getUpgradeLevelCost: () => s.upgrade.cost(s.upgrade.level),
             levelUpgrade: () => {
@@ -407,18 +464,18 @@ function mockNs() {
                 s.funds -= cost;
                 s.advert.level++;
             },
-            hasWarehouse: () => s.warehouse !== null,
-            purchaseWarehouse: () => {
-                if (s.funds < WAREHOUSE_INITIAL_COST || s.warehouse !== null) return;
+            hasWarehouse: (_div, city) => s.warehouses[city] !== undefined,
+            purchaseWarehouse: (_div, city) => {
+                if (s.funds < WAREHOUSE_INITIAL_COST || s.warehouses[city]) return; // game source: silent no-op
                 s.funds -= WAREHOUSE_INITIAL_COST;
-                s.warehouse = { level: 1 };
+                s.warehouses[city] = { level: 1 };
             },
-            getWarehouse: () => s.warehouse,
-            upgradeWarehouse: (_div, _city, amt) => {
+            getWarehouse: (_div, city) => s.warehouses[city],
+            upgradeWarehouse: (_div, city, amt) => {
                 const cost = 2e9 * amt;
                 if (s.funds < cost) return;
                 s.funds -= cost;
-                s.warehouse.level += amt;
+                s.warehouses[city].level += amt;
             },
             getOffice: () => ({
                 city: "Sector-12",
@@ -459,6 +516,7 @@ function mockNs() {
                 s.buyOrders[material] = amt;
             },
             nextUpdate: async () => {
+                s.funds += 3e9; // the corporation earns every cycle, which is what makes waiting for an office finite
                 for (const material of BOOST_MATERIALS) s.stored[material] += 10 * Math.min(s.buyOrders[material], 5);
                 return "START";
             },
@@ -520,6 +578,31 @@ export async function selfCheck() {
     // Timeout path: the target is unreachable in 2 cycles → shortfall reported, orders cleared anyway (§1.1).
     const short = await stockBoostMaterials(ns, "Dark Soil", { "Sector-12": [1e6, 0, 0, 0] }, 2);
     must(short["Sector-12"] !== undefined && s.buyOrders["AI Cores"] === 0, `shortfall ${JSON.stringify(short)} order ${s.buyOrders["AI Cores"]}`);
+
+    // ensureDivision WAITS for the office money (the bug: a round whose funds ran out left "Black Salt" in 1 of
+    // 6 cities, and then every per-city reader threw "has not expanded to 'Ishima'"). With 1e9 in hand it may
+    // not call expandCity at all - the mock throws the game's own purchaseOffice error if it does - and it must
+    // finish with every city, earning its way there one cycle at a time.
+    const nsWait = mockNs();
+    const sWait = nsWait.corporation.__state;
+    sWait.divisions["Black Salt"] = ["Sector-12"];
+    sWait.funds = 1e9;
+    sWait.expenses = 38e3; // the state that confused the daemon tail: salaries with no revenue
+    must(await ensureDivision(nsWait, "Chemical", "Black Salt", ["Sector-12", "Aevum"], 1, 0), "ensureDivision returns true once every city is done");
+    must(sWait.divisions["Black Salt"].length === 2, `ensureDivision waited and expanded every city: ${JSON.stringify(sWait.divisions["Black Salt"])}`);
+    must(sWait.logs.some((line) => line.includes("waiting for 4.00b")), "the wait for an office is logged");
+    must(sWait.logs.some((line) => line.includes("profit -38000/s")), "the wait log shows whether the corporation is earning");
+    // ...and the WAREHOUSE is waited for too: purchaseWarehouse refuses silently, and the round's first
+    // exportMaterial then threw "Cannot export to Aevum in division Black Salt because there is no warehouse".
+    must(sWait.warehouses.Aevum?.level === 1 && sWait.warehouses["Sector-12"]?.level === 1, `warehouse in every city ${JSON.stringify(sWait.warehouses)}`);
+    must(sWait.logs.some((line) => line.includes("for the Aevum warehouse")), "the wait for a warehouse is logged");
+    // A division that cannot be CREATED (funds, or the division cap the game throws on) still reports failure.
+    const nsNo = mockNs();
+    nsNo.corporation.__state.funds = 0;
+    nsNo.corporation.expandIndustry = () => {
+        throw new Error("You cannot create a new division: not enough money");
+    };
+    must((await ensureDivision(nsNo, "Chemical", "New One", ["Sector-12"], 1, 0)) === false, "a refused creation returns false");
 
     return true;
 }

@@ -42,7 +42,7 @@
  *      `run Corp/corp-improve.js --division "Dark Soil" --support --budget 30e9 --round 3`
  */
 import { formatMoney, getConfiguration } from "../helpers.js";
-import { BOOST_MATERIALS, OFFER_PREP_FILE, alreadyRunning, corpLog, getCities, runWorker } from "./corp-lib.js";
+import { BOOST_MATERIALS, OFFER_PREP_FILE, alreadyRunning, corpLog, runWorker } from "./corp-lib.js";
 import {
     bestStorageFactoryWarehouse,
     maxAffordableLevel,
@@ -274,7 +274,10 @@ async function run(ns, cfg) {
         corpLog(ns, `no "${cfg.division}" division (have ${corp.divisions.join(", ")}) - nothing to improve`, "ERROR");
         return;
     }
-    const cities = getCities(ns);
+    // The division's own city list (getDivision is already in this file's API budget - boostFactors uses it):
+    // a division that is still expanding has fewer than 6 cities, and getWarehouse/getMaterial THROW for one it
+    // is not in. Never getCities(ns) here.
+    const cities = ns.corporation.getDivision(cfg.division).cities;
     const factors = boostFactors(ns, cfg.division);
     if (cfg.support) await improveSupportDivision(ns, cfg, cities, factors);
     else await improveProductDivision(ns, cfg, cities, factors);
