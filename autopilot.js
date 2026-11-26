@@ -92,6 +92,42 @@ export function daemonRamReserveChanged(runningArgs, reservedRam) {
     return running !== reservedRam;
 }
 
+/** Pure: home RAM (GB) stanek.js must keep out of its own charge script, for the corporation's suite.
+ *  0 = pass NO reserve flags at all, leaving stanek.js's own defaults (32, or its 64 "ideal") alone - correct
+ *  while nothing else needs home, because daemon.js is parked at --reserved-ram 1e100 the whole time stanek runs.
+ *  BOTH flags are needed, not just --reserved-ram: stanek.js:179 charges with --reserved-ram-ideal whenever the
+ *  free RAM it sees is above 640 GB (its idealReservedRam / availableRam < 0.05 test, with a local
+ *  idealReservedRam = 32), which is every charge on a big home. That is the bug: 65 GB free on a 16.4 TB home
+ *  and Corp/corp-snapshot.js needs 101.6 GB, so the corporation's suite could not run while stanek charged.
+ *  @param {{corpNeedsHome: boolean}} s @returns {number} **/
+export function stanekHomeReserve({ corpNeedsHome }) {
+    return corpNeedsHome ? CORP_HOME_RESERVE : 0;
+}
+
+/** Pure: does the live stanek.js need a restart to pick up `reserve`? Mirrors daemonRamReserveChanged: stanek.js
+ *  reads its flags once at startup, so a corporation that appears while it is charging would otherwise never
+ *  shrink its take. `reserve === 0` means "pass NO flags" (stanek.js's own defaults apply), so the only relaunch
+ *  it can justify is taking existing flags away - comparing against those defaults relaunched forever.
+ *  @param {ScriptArg[]|undefined} runningArgs the live stanek.js's args (undefined = it is not running)
+ *  @param {number} reserve the value we want it to run with @returns {boolean} **/
+export function stanekRamReserveChanged(runningArgs, reserve) {
+    if (!runningArgs) return false; // not running: the launch path starts it with the new args
+    const argNum = (flag) => { const i = runningArgs.indexOf(flag); return i >= 0 ? Number(runningArgs[i + 1]) : null; };
+    const running = [argNum("--reserved-ram"), argNum("--reserved-ram-ideal")];
+    if (reserve === 0) return running.some(v => v !== null); // we want no flags: relaunch only to remove them
+    return running.some(v => v !== reserve);
+}
+
+/** Pure: the args stanek.js is launched with. `reserve` > 0 adds BOTH reserve flags (see stanekHomeReserve).
+ *  @param {{daemonPath: string, daemonArgs: ScriptArg[], reserve: number, noTail: boolean}} a @returns {ScriptArg[]} **/
+export function stanekLaunchArgs({ daemonPath, daemonArgs, reserve, noTail }) {
+    const args = ["--on-completion-script", daemonPath]; // Charging finished: hand home back to daemon.js
+    if (noTail) args.push('--no-tail'); // Relay the option to suppress tail windows
+    if (daemonArgs.length >= 0) args.push("--on-completion-script-args", JSON.stringify(daemonArgs)); // Pass in all the args we wanted to run daemon.js with
+    if (reserve > 0) args.push("--reserved-ram", reserve, "--reserved-ram-ideal", reserve); // Both, or stanek.js ignores us on a big home
+    return args;
+}
+
 /** Offline check for the pure decision above: node --input-type=module -e "import('./autopilot.js').then(m => m.selfCheck())" */
 export function selfCheck() {
     const eq = (got, want, label) => {
@@ -133,6 +169,23 @@ export function selfCheck() {
     eq(daemonRamReserveChanged(["--disable-script", "work-for-factions.js"], 0), false, "reserve 0: no flag wanted, none running - never relaunch");
     eq(daemonRamReserveChanged(["--reserved-ram", 1e100], 0), true, "reserve 0: stanek ended - hand RAM back");
     eq(daemonRamReserveChanged(["--reserved-ram", CORP_HOME_RESERVE], 0), true, "reserve 0: corporation closed - hand RAM back");
+    // stanekHomeReserve/stanekRamReserveChanged/stanekLaunchArgs: the corporation's home envelope has to
+    // reach stanek.js too (it reserves only its own 32/64 GB), and stanek.js reads its args once, so a
+    // CHANGED reserve needs the explicit relaunch that daemonRamReserveChanged exists for.
+    eq(stanekHomeReserve({ corpNeedsHome: true }), CORP_HOME_RESERVE, "stanek reserve: the corporation needs home RAM");
+    eq(stanekHomeReserve({ corpNeedsHome: false }), 0, "stanek reserve: nothing else needs home - leave stanek.js's own defaults alone");
+    eq(stanekRamReserveChanged(undefined, CORP_HOME_RESERVE), false, "stanek reserve: stanek.js not running");
+    eq(stanekRamReserveChanged(["--on-completion-script", "daemon.js"], CORP_HOME_RESERVE), true, "stanek reserve: running with no reserve flags - relaunch");
+    eq(stanekRamReserveChanged(["--reserved-ram", CORP_HOME_RESERVE, "--reserved-ram-ideal", CORP_HOME_RESERVE], CORP_HOME_RESERVE), false, "stanek reserve: already correct - must not relaunch every check");
+    eq(stanekRamReserveChanged(["--reserved-ram", CORP_HOME_RESERVE], CORP_HOME_RESERVE), true, "stanek reserve: --reserved-ram alone is ignored on a big home - set the ideal flag too");
+    eq(stanekRamReserveChanged(["--reserved-ram", 1e100, "--reserved-ram-ideal", 1e100], 0), true, "stanek reserve 0: hand RAM back");
+    eq(stanekRamReserveChanged(["--on-completion-script", "daemon.js"], 0), false, "stanek reserve 0: no flags wanted, none running - never relaunch");
+    eq(stanekLaunchArgs({ daemonPath: "daemon.js", daemonArgs: [], reserve: 0, noTail: false }),
+        ["--on-completion-script", "daemon.js", "--on-completion-script-args", "[]"], "stanek args: no corporation - no reserve flags");
+    eq(stanekLaunchArgs({ daemonPath: "daemon.js", daemonArgs: [], reserve: CORP_HOME_RESERVE, noTail: true }),
+        ["--on-completion-script", "daemon.js", "--no-tail", "--on-completion-script-args", "[]",
+            "--reserved-ram", CORP_HOME_RESERVE, "--reserved-ram-ideal", CORP_HOME_RESERVE],
+        "stanek args: corporation - BOTH reserve flags, so the 640 GB ideal branch cannot discard it");
     return true;
 }
 
@@ -822,21 +875,33 @@ export async function main(ns) {
             if (options['no-tail-windows']) daemonArgs.push('--no-tail-windows');
         }
 
+        // Home RAM the corporation's suite needs out of stanek.js - the same input the daemon reserve below uses.
+        // A corporation survives an install, so this is true from the start of every reset after the first one; it
+        // flips true mid-reset when the corporation is first created while stanek.js is already charging.
+        const corpNeedsHome = !!findScript('corp.js') || ns.corporation.hasCorporation(); // 0 GB
+        const stanekReserve = stanekHomeReserve({ corpNeedsHome });
+        const launchStanek = () => launchScriptHelper(ns, 'stanek.js', stanekLaunchArgs({
+            daemonPath: getFilePath('daemon.js'), daemonArgs, reserve: stanekReserve, noTail: options['no-tail-windows'],
+        }));
         // Once stanek's gift is accepted, launch it once per reset before we launch daemon (Note: stanek's gift is auto-purchased by faction-manager.js on your first install)
         let stanekRunning = (13 in unlockedSFs) && findScript('stanek.js') !== undefined;
         if ((13 in unlockedSFs) && !stanekLaunched && !stanekRunning && installedAugmentations.includes(augStanek)) {
             stanekLaunched = true; // Once we've know we've launched stanek once, we never have to again this reset.
-            const stanekArgs = ["--on-completion-script", getFilePath('daemon.js')]
-            if (options['no-tail-windows']) stanekArgs.push('--no-tail'); // Relay the option to suppress tail windows
-            if (daemonArgs.length >= 0) stanekArgs.push("--on-completion-script-args", JSON.stringify(daemonArgs)); // Pass in all the args we wanted to run daemon.js with
-            launchScriptHelper(ns, 'stanek.js', stanekArgs);
+            launchStanek();
             stanekRunning = true;
+        }
+        // The corporation appeared (or went away) while stanek.js was charging: restart it so it gives up (or hands
+        // back) CORP_HOME_RESERVE. stanek.js reads its flags at startup, so a relaunch is the only way to apply a
+        // changed value - the same reason daemon.js needs daemonRamReserveChanged.
+        else if (stanekRunning && stanekRamReserveChanged(findScript('stanek.js').args, stanekReserve)) {
+            if (await killScript(ns, 'stanek.js', runningScripts))
+                launchStanek();
         }
         // Reserve home RAM for whatever outranks hacking batches: stanek's gift (all of home), an early
         // SF4, or the running corporation (see CORP_HOME_RESERVE). Exactly one --reserved-ram, because
         // ns.flags is non-permissive and a duplicated flag has no defined winner.
         const reservedRam = reservedHomeRam({
-            stanekRunning, sf4: unlockedSFs[4], corpRunning: !!findScript('corp.js') || ns.corporation.hasCorporation(),
+            stanekRunning, sf4: unlockedSFs[4], corpRunning: corpNeedsHome,
         });
         if (reservedRam > 0) daemonArgs.push("--reserved-ram", reservedRam);
 
